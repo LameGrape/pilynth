@@ -1,6 +1,9 @@
+using Pilynth.Attributes;
+
 namespace Pilynth.Fabric;
 
-public abstract class Item
+[YarnBind("net.minecraft.item.Item")]
+public class Item
 {
 
 }

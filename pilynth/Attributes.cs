@@ -7,5 +7,12 @@ public class JavaBindAttribute : Attribute
     public JavaBindAttribute(string name) { this.name = name; }
 }
 
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Interface, AllowMultiple = false)]
+public class YarnBindAttribute : Attribute
+{
+    public readonly string name;
+    public YarnBindAttribute(string name) { this.name = name; }
+}
+
 [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
 public class EntryPointAttribute : Attribute { }
