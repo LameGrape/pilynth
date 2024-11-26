@@ -3,11 +3,23 @@
   <PropertyGroup>
     <OutputType>library</OutputType>
     <TargetFramework>net8.0</TargetFramework>
+
+    <Title>Pilynth</Title>
+    <Version>0.2.1</Version>
+    <Authors>EpicRaisin</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/LameGrape/pilynth</RepositoryUrl>
+    <Description>
+      A library for writing Minecraft mods in C#.
+    </Description>
+
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
   <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\"/>
     <PackageReference Include="EndianBinaryIO" Version="2.1.0"/>
   </ItemGroup>
 

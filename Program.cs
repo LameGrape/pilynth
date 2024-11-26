@@ -6,20 +6,40 @@ using System.Text;
 using Pilynth.Attributes;
 using Kermalis.EndianBinaryIO;
 using Pilynth.Fabric;
+using System.Xml.Linq;
 
 namespace Pilynth;
 
 public class Mod
 {
-    public Mod(string mcVersion)
+    public Mod(string[] args)
     {
+        if (args.Length == 0)
+        {
+            Console.WriteLine("Version number is required");
+            return;
+        }
+        string mcVersion = args[0];
+
+        YarnMappings.PrepareMappings(mcVersion);
+
         Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
         List<JavaClass> classes = new();
         string identifier = "", version = "", entrypoint = "";
         JavaClass entryClass;
+
+        JavaClass.LogLevel logLevel = JavaClass.LogLevel.None;
+        if (args.Length > 1 && args[1].StartsWith("--"))
+        {
+            if (args[1].Contains("p")) logLevel |= JavaClass.LogLevel.ConstantPool;
+            if (args[1].Contains("b")) logLevel |= JavaClass.LogLevel.Bytecode;
+            if (args[1].Contains("c")) logLevel |= JavaClass.LogLevel.Classes;
+            if (args[1].Contains("i")) logLevel |= JavaClass.LogLevel.Internals;
+        }
+
         foreach (Type type in types)
         {
-            JavaClass clazz = new JavaClass(type);
+            JavaClass clazz = new JavaClass(type, logLevel);
             classes.Add(clazz);
             if (typeof(FabricMod).IsAssignableFrom(type))
             {
@@ -31,19 +51,19 @@ public class Mod
         }
         JavaArchive jar = new JavaArchive(identifier, version, entrypoint, mcVersion, classes.ToArray());
         if (!Directory.Exists("build")) Directory.CreateDirectory("build");
-        Console.WriteLine($"build/{identifier}-v{version}-{mcVersion}.jar");
+        Console.WriteLine($"Exporting to build/{identifier}-v{version}-{mcVersion}.jar");
         jar.WriteJarFile($"build/{identifier}-v{version}-{mcVersion}.jar");
     }
 }
 
 internal class YarnMappings
 {
-    //     internal static void PrepareMappings(string version)
-    //     {
-    //         XDocument metadata = XDocument.Load("https://maven.fabricmc.net/net/fabricmc/yarn/maven-metadata.xml");
-    //         string yarnVersion = metadata.Descendants("version").Last(element => element.Value.StartsWith(version)).Value;
-    //         System.Console.WriteLine(yarnVersion);
-    //     } TODO: download mappings for the specified version instead of being hardcoded
+    internal static void PrepareMappings(string version)
+    {
+        XDocument metadata = XDocument.Load("https://maven.fabricmc.net/net/fabricmc/yarn/maven-metadata.xml");
+        string yarnVersion = metadata.Descendants("version").Last(element => element.Value.StartsWith(version)).Value;
+        System.Console.WriteLine(yarnVersion);
+    } // TODO: download mappings for the specified version instead of being hardcoded
 
     // internal static void GetMapping(string path, string type)
     // {
@@ -78,13 +98,17 @@ internal class YarnMappings
 
 internal class JavaClass
 {
+    [Flags]
     internal enum LogLevel
     {
-        None,
-        Full
+        None = 0,
+        ConstantPool = 1,
+        Bytecode = 2,
+        Internals = 4,
+        Classes = 8
     }
 
-    internal LogLevel logLevel = LogLevel.Full;
+    internal LogLevel logLevel = LogLevel.None;
 
     internal List<object> constants = new();
     internal List<JavaField> fields = new();
@@ -92,13 +116,15 @@ internal class JavaClass
     internal List<ushort> interfaces = new();
     internal Type originalType;
 
-    internal JavaClass(Type type)
+    internal JavaClass(Type type, LogLevel logLevel)
     {
+        this.logLevel = logLevel;
+
         originalType = type;
         string? thisClass = type.FullName;
         string? superClass = GetClassName(type.BaseType);
 
-        if (logLevel == LogLevel.Full)
+        if (logLevel.HasFlag(LogLevel.Classes) || logLevel.HasFlag(LogLevel.Internals) || logLevel.HasFlag(LogLevel.Bytecode))
         {
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"{thisClass} : {superClass}");
@@ -115,7 +141,7 @@ internal class JavaClass
         foreach (FieldInfo field in type.GetFields(BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance))
         {
             if (field.DeclaringType != type) continue;
-            if (logLevel == LogLevel.Full)
+            if (logLevel == LogLevel.Internals || logLevel == LogLevel.Bytecode)
             {
                 Console.ForegroundColor = ConsoleColor.Blue;
                 Console.WriteLine($"    Field {field.DeclaringType}.{field.Name}");
@@ -147,7 +173,7 @@ internal class JavaClass
     internal void HandleMethod(MethodBase method, Type type)
     {
         if (method.DeclaringType != type) return;
-        if (logLevel == LogLevel.Full)
+        if (logLevel.HasFlag(LogLevel.Internals) || logLevel.HasFlag(LogLevel.Bytecode))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine($"    Method {method.DeclaringType}.{method.Name}");
@@ -463,12 +489,6 @@ internal class JavaClass
         List<byte> bytecode = new List<byte>();
         string[] locals = new string[body.LocalVariables.Count + method.GetParameters().Length + 1];
 
-        if (logLevel == LogLevel.Full)
-        {
-            Console.ForegroundColor = ConsoleColor.Gray;
-            Console.WriteLine($"        {body.MaxStackSize} stack - {body.LocalVariables.Count} locals");
-        }
-
         int ji = 0;
 
         for (int i = 0; i < ilcode.Length; i++)
@@ -729,7 +749,7 @@ internal class JavaClass
                         i += 4;
                         break;
                     default:
-                        if (logLevel == LogLevel.Full)
+                        if (logLevel.HasFlag(LogLevel.Bytecode))
                         {
                             Console.ForegroundColor = ConsoleColor.Yellow;
                             Console.Error.WriteLine($"      Unimplemented opcode: {BitConverter.ToString([(byte)opcode])}");
@@ -739,18 +759,18 @@ internal class JavaClass
                         break;
                 }
             }
-            catch (Exception error)
+            catch
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 foreach (var sp in stackpoints) Console.WriteLine(sp.ji + " " + sp.depth);
-                throw error;
+                throw;
             }
             ji += 1 + newArgs.Length;
             if (valid)
             {
                 bytecode.Add(newOpcode);
                 foreach (byte arg in newArgs) bytecode.Add(arg);
-                if (logLevel == LogLevel.Full)
+                if (logLevel.HasFlag(LogLevel.Bytecode))
                 {
                     Console.ForegroundColor = ConsoleColor.Gray;
                     Console.Write($"        {oldStack}:{stack.Count} ");
@@ -821,10 +841,10 @@ internal class JavaClass
 
     internal void WriteClassFile(Stream stream)
     {
-        if (logLevel == LogLevel.Full)
+        if (logLevel.HasFlag(LogLevel.ConstantPool))
         {
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine(originalType.FullName);
+            Console.WriteLine("Writing " + originalType.FullName);
         }
         var writer = new EndianBinaryWriter(stream, endianness: Endianness.BigEndian);
         writer.WriteUInt32(0xCAFEBABE); // magic number
@@ -833,7 +853,7 @@ internal class JavaClass
         ushort i = 0;
         foreach (object constant in constants)
         {
-            if (logLevel == LogLevel.Full)
+            if (logLevel.HasFlag(LogLevel.ConstantPool))
             {
                 Console.ForegroundColor = ConsoleColor.Gray;
                 Console.Write(BitConverter.ToString(BitConverter.GetBytes(FlipBytes((ushort)(i + 1)))) + ": ");
@@ -955,6 +975,7 @@ internal class JavaArchive
 
     internal void WriteJarFile(string path)
     {
+        if (File.Exists(path)) File.Delete(path);
         using (var file = new FileStream(path, FileMode.OpenOrCreate))
         {
             using (var archive = new ZipArchive(file, ZipArchiveMode.Update))
