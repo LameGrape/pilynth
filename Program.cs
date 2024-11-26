@@ -16,19 +16,22 @@ public class Mod
         Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
         List<JavaClass> classes = new();
         string identifier = "", version = "", entrypoint = "";
+        JavaClass entryClass;
         foreach (Type type in types)
         {
-            classes.Add(new JavaClass(type));
+            JavaClass clazz = new JavaClass(type);
+            classes.Add(clazz);
             if (typeof(FabricMod).IsAssignableFrom(type))
             {
                 identifier = type.GetCustomAttribute<IdentifierAttribute>().identifier;
                 version = type.GetCustomAttribute<VersionAttribute>().version;
                 entrypoint = type.FullName;
+                entryClass = clazz;
             }
         }
         JavaArchive jar = new JavaArchive(identifier, version, entrypoint, mcVersion, classes.ToArray());
         if (!Directory.Exists("build")) Directory.CreateDirectory("build");
-        System.Console.WriteLine($"build/{identifier}-v{version}-{mcVersion}.jar");
+        Console.WriteLine($"build/{identifier}-v{version}-{mcVersion}.jar");
         jar.WriteJarFile($"build/{identifier}-v{version}-{mcVersion}.jar");
     }
 }
@@ -41,6 +44,16 @@ internal class YarnMappings
     //         string yarnVersion = metadata.Descendants("version").Last(element => element.Value.StartsWith(version)).Value;
     //         System.Console.WriteLine(yarnVersion);
     //     } TODO: download mappings for the specified version instead of being hardcoded
+
+    // internal static void GetMapping(string path, string type)
+    // {
+    //     string[] split = path.Split();
+    //     string combined = "yarn/";
+    //     foreach (string segment in split)
+    //     {
+    //         if (File.Exists(combined + segment + ".mapping"))
+    //     }
+    // }
 
     internal static string ConvertMethod(string method)
     {
@@ -88,7 +101,7 @@ internal class JavaClass
         if (logLevel == LogLevel.Full)
         {
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"{thisClass} : {originalType.FullName}");
+            Console.WriteLine($"{thisClass} : {superClass}");
             Console.ForegroundColor = ConsoleColor.White;
         }
 
@@ -122,7 +135,13 @@ internal class JavaClass
         {
             HandleMethod(method, type);
         }
-        HandleMethod(type.GetConstructor([]), type);
+        HandleMethod(type.GetConstructors()[0], type);
+    }
+
+    internal struct ConvertedMethod
+    {
+        internal byte[] code;
+        internal ushort maxStack;
     }
 
     internal void HandleMethod(MethodBase method, Type type)
@@ -131,7 +150,7 @@ internal class JavaClass
         if (logLevel == LogLevel.Full)
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"    Method {method.DeclaringType}.{method.Name} -");
+            Console.WriteLine($"    Method {method.DeclaringType}.{method.Name}");
             Console.ForegroundColor = ConsoleColor.White;
         }
 
@@ -146,14 +165,14 @@ internal class JavaClass
             descriptorIndex = AddToConstants(descriptor)
         };
 
-        byte[] code = ConvertMethod(method);
+        ConvertedMethod converted = ConvertMethod(method);
         CodeAttribute attribute = new CodeAttribute
         {
-            length = (uint)(2 * 2 + 4 * 2 + code.Length), // 3 shorts, 2 ints, and code length
-            maxStack = (ushort)body.MaxStackSize,
+            length = (uint)(2 * 2 + 4 * 2 + converted.code.Length), // 3 shorts, 2 ints, and code length
+            maxStack = converted.maxStack,
             maxLocals = (ushort)(body.LocalVariables.Count + method.GetParameters().Length + 1),
-            codeLength = (uint)code.Length,
-            code = code
+            codeLength = (uint)converted.code.Length,
+            code = converted.code
         };
         attribute.nameIndex = AddToConstants("Code");
         javaMethod.codeAttribute = attribute;
@@ -199,6 +218,7 @@ internal class JavaClass
         if (bind != null) return bind.name.Split(".").Last();
         YarnBindAttribute yarnBind = method.GetCustomAttribute<YarnBindAttribute>();
         if (yarnBind != null) return YarnMappings.ConvertMethod(yarnBind.name.Split("/").Last());
+        if (method.Name == ".ctor") return "<init>";
         return method.Name;
     }
 
@@ -216,16 +236,25 @@ internal class JavaClass
             string[] fullName = yarnBind.name.Split("/");
             return string.Join("/", fullName.AsSpan(0, fullName.Length - 1).ToArray());
         }
-        return method.DeclaringType.FullName.Replace(".", "/");
+        return ConvertBuiltinName(method.DeclaringType);
     }
 
     internal string GetClassName(Type type)
     {
-        JavaBindAttribute bind = type.GetCustomAttribute<JavaBindAttribute>();
+        JavaBindAttribute bind = type.GetCustomAttribute<JavaBindAttribute>(false);
         if (bind != null) return bind.name.Replace(".", "/");
-        YarnBindAttribute yarnBind = type.GetCustomAttribute<YarnBindAttribute>();
+        YarnBindAttribute yarnBind = type.GetCustomAttribute<YarnBindAttribute>(false);
         if (yarnBind != null) return YarnMappings.ConvertClass(yarnBind.name);
         return type.FullName.Replace(".", "/");
+    }
+
+    internal string GetFieldName(FieldInfo field)
+    {
+        JavaBindAttribute bind = field.GetCustomAttribute<JavaBindAttribute>();
+        if (bind != null) return bind.name.Replace(".", "/");
+        YarnBindAttribute yarnBind = field.GetCustomAttribute<YarnBindAttribute>();
+        if (yarnBind != null) return YarnMappings.ConvertClass(yarnBind.name);
+        return field.Name;
     }
 
     internal ushort FlipBytes(ushort number)
@@ -407,9 +436,19 @@ internal class JavaClass
         ldstr = 0x72,
         newobj = 0x73, // <int32>
         stfld = 0x7D, // <int32>
+        stsfld = 080, // <int32>
+        ldfld = 0x7B, // <int32>
+        ldsfld = 0x7E, // <int32>
+        pop = 0x26,
     }
 
-    private byte[] ConvertMethod(MethodBase method)
+    internal struct Stackpoint
+    {
+        internal int ji;
+        internal int depth;
+    }
+
+    private ConvertedMethod ConvertMethod(MethodBase method)
     {
         MethodBody? body = method.GetMethodBody();
         byte[]? ilcode = body.GetILAsByteArray();
@@ -417,9 +456,20 @@ internal class JavaClass
         Module module = method.DeclaringType.Module;
 
         string returnType = method is MethodInfo ? (method as MethodInfo).ReturnType.Name : "Void";
+        int oldStack = 0;
         Stack<string> stack = new Stack<string>(body.MaxStackSize);
+        ushort maxStack = (ushort)body.MaxStackSize;
+        List<Stackpoint> stackpoints = [new Stackpoint { ji = 0, depth = 0 }]; // locations in the bytecode where items were added to the stack
         List<byte> bytecode = new List<byte>();
         string[] locals = new string[body.LocalVariables.Count + method.GetParameters().Length + 1];
+
+        if (logLevel == LogLevel.Full)
+        {
+            Console.ForegroundColor = ConsoleColor.Gray;
+            Console.WriteLine($"        {body.MaxStackSize} stack - {body.LocalVariables.Count} locals");
+        }
+
+        int ji = 0;
 
         for (int i = 0; i < ilcode.Length; i++)
         {
@@ -432,192 +482,280 @@ internal class JavaClass
 
             int offset;
             string item; // both are used later so i just define them here
-            switch (opcode)
+            FieldInfo resolvedField;
+            try
             {
-                case Opcodes.nop:
-                    newOpcode = 0;
-                    break;
-                case Opcodes._break:
-                    newOpcode = 0xCA;
-                    break;
-                case Opcodes.ldarg_0:
-                case Opcodes.ldarg_1:
-                case Opcodes.ldarg_2:
-                case Opcodes.ldarg_3:
-                case Opcodes.ldarg_s:
-                    offset = (byte)(opcode - Opcodes.ldarg_0);
-                    if (opcode == Opcodes.ldarg_s) offset = ilcode[++i];
-                    item = locals[offset];
-                    if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
-                    if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
-                    if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
-                    if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
-                    if (opcode == Opcodes.ldarg_0) newOpcode = 0x2A;
-                    if (offset > 3) newArgs = [(byte)offset];
-                    stack.Push(item);
-                    break;
-                case Opcodes.ldloc_0:
-                case Opcodes.ldloc_1:
-                case Opcodes.ldloc_2:
-                case Opcodes.ldloc_3:
-                case Opcodes.ldloc_s:
-                    offset = (byte)(opcode - Opcodes.ldloc_0);
-                    if (opcode == Opcodes.ldloc_s) offset = ilcode[++i];
-                    offset += method.GetParameters().Length;
-                    item = locals[offset];
-                    if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
-                    if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
-                    if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
-                    if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
-                    if (offset > 3) newArgs = [(byte)offset];
-                    stack.Push(item);
-                    break;
-                case Opcodes.stloc_0:
-                case Opcodes.stloc_1:
-                case Opcodes.stloc_2:
-                case Opcodes.stloc_3:
-                case Opcodes.stloc_s:
-                    offset = (byte)(opcode - Opcodes.stloc_0);
-                    if (opcode == Opcodes.stloc_s) offset = ilcode[++i];
-                    if (opcode != Opcodes.stloc_0) offset += method.GetParameters().Length;
-                    item = stack.Pop();
-                    if (item == "Int32") newOpcode = offset > 3 ? (byte)0x36 : (byte)(0x3B + offset);
-                    if (item == "Int64") newOpcode = offset > 3 ? (byte)0x37 : (byte)(0x3F + offset);
-                    if (item == "Single") newOpcode = offset > 3 ? (byte)0x38 : (byte)(0x43 + offset);
-                    if (item == "Double") newOpcode = offset > 3 ? (byte)0x39 : (byte)(0x47 + offset);
-                    if (offset > 3) newArgs = [(byte)offset];
-                    break;
-                case Opcodes.ldc_r4:
-                    newOpcode = 0x12;
-                    stack.Push("Single");
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    float constant = BitConverter.ToSingle(args);
-                    newArgs = [(byte)AddToConstants(constant)];
-                    i += 4;
-                    break;
-                case Opcodes.dup:
-                    newOpcode = 0x59;
-                    stack.Push(stack.Peek());
-                    break;
-                case Opcodes.ldstr:
-                    newOpcode = 0x12;
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    string resolvedString = module.ResolveString(BitConverter.ToInt32(args));
-                    debug = resolvedString;
-                    newArgs = [(byte)AddToConstants(new StringReference { text = resolvedString })];
-                    i += 4;
-                    break;
-                case Opcodes.call:
-                case Opcodes.callvirt:
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    MethodBase resolvedMethod = module.ResolveMethod(BitConverter.ToInt32(args));
-                    string name = GetMethodName(resolvedMethod);
-                    debug = name;
-                    newOpcode = resolvedMethod.IsStatic ? (byte)0xB8 : (byte)0xB7;
-                    newOpcode = opcode == Opcodes.call ? newOpcode : (byte)0xB6;
-                    if (resolvedMethod.DeclaringType.IsInterface)
-                    {
-                        newOpcode = 0xB9;
-                        InterfaceMethodReference methodRef = new InterfaceMethodReference()
+                switch (opcode)
+                {
+                    case Opcodes.nop:
+                        newOpcode = 0;
+                        break;
+                    case Opcodes._break:
+                        newOpcode = 0xCA;
+                        break;
+                    case Opcodes.ldarg_0:
+                    case Opcodes.ldarg_1:
+                    case Opcodes.ldarg_2:
+                    case Opcodes.ldarg_3:
+                    case Opcodes.ldarg_s:
+                        offset = (byte)(opcode - Opcodes.ldarg_0);
+                        if (opcode == Opcodes.ldarg_s) offset = ilcode[++i];
+                        item = offset > 0 ? method.GetParameters()[offset - 1].ParameterType.Name : "this";
+                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
+                        else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
+                        else if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
+                        else if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
+                        else newOpcode = offset > 3 ? (byte)0x19 : (byte)(0x2A + offset);
+                        if (opcode == Opcodes.ldarg_0) newOpcode = 0x2A;
+                        if (offset > 3) newArgs = [(byte)offset];
+                        stack.Push(opcode == Opcodes.ldarg_0 ? method.DeclaringType.Name : method.GetParameters()[offset - 1].Name);
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        break;
+                    case Opcodes.ldloc_0:
+                    case Opcodes.ldloc_1:
+                    case Opcodes.ldloc_2:
+                    case Opcodes.ldloc_3:
+                    case Opcodes.ldloc_s:
+                        offset = (byte)(opcode - Opcodes.ldloc_0);
+                        if (opcode == Opcodes.ldloc_s) offset = ilcode[++i];
+                        offset += method.GetParameters().Length + 1;
+                        item = locals[offset];
+                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
+                        else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
+                        else if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
+                        else if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
+                        else newOpcode = offset > 3 ? (byte)0x19 : (byte)(0x2A + offset);
+                        if (offset > 3) newArgs = [(byte)offset];
+                        stack.Push(item);
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        break;
+                    case Opcodes.stloc_0:
+                    case Opcodes.stloc_1:
+                    case Opcodes.stloc_2:
+                    case Opcodes.stloc_3:
+                    case Opcodes.stloc_s:
+                        offset = (byte)(opcode - Opcodes.stloc_0);
+                        if (opcode == Opcodes.stloc_s) offset = ilcode[++i];
+                        item = stack.Pop();
+                        locals[offset] = item;
+                        offset += method.GetParameters().Length + 1;
+                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x36 : (byte)(0x3B + offset);
+                        else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x37 : (byte)(0x3F + offset);
+                        else if (item == "Single") newOpcode = offset > 3 ? (byte)0x38 : (byte)(0x43 + offset);
+                        else if (item == "Double") newOpcode = offset > 3 ? (byte)0x39 : (byte)(0x47 + offset);
+                        else newOpcode = offset > 3 ? (byte)0x3A : (byte)(0x4B + offset);
+                        if (offset > 3) newArgs = [(byte)offset];
+                        break;
+                    case Opcodes.ldc_r4:
+                        newOpcode = 0x12;
+                        stack.Push("Single");
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        float constant = BitConverter.ToSingle(args);
+                        newArgs = [(byte)AddToConstants(constant)];
+                        i += 4;
+                        break;
+                    case Opcodes.dup:
+                        newOpcode = 0x59;
+                        stack.Push(stack.Peek());
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        break;
+                    case Opcodes.pop:
+                        newOpcode = 0x57;
+                        stack.Pop();
+                        break;
+                    case Opcodes.ldstr:
+                        newOpcode = 0x12;
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        string resolvedString = module.ResolveString(BitConverter.ToInt32(args));
+                        debug = resolvedString;
+                        newArgs = [(byte)AddToConstants(new StringReference { text = resolvedString })];
+                        stack.Push("String");
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        i += 4;
+                        break;
+                    case Opcodes.call:
+                    case Opcodes.callvirt:
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        MethodBase resolvedMethod = module.ResolveMethod(BitConverter.ToInt32(args));
+                        string name = GetMethodName(resolvedMethod);
+                        debug = name;
+                        newOpcode = resolvedMethod.IsStatic ? (byte)0xB8 : resolvedMethod.IsPrivate || resolvedMethod.IsConstructor ? (byte)0xB7 : (byte)0xB6;
+                        newOpcode = opcode == Opcodes.call ? newOpcode : (byte)0xB6;
+                        if (resolvedMethod.DeclaringType.IsInterface)
                         {
-                            classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
-                            nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
-                        };
-                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
-                        newArgs = [newArgs[0], newArgs[1], (byte)(resolvedMethod.GetParameters().Length + 1), 0];
-                    }
-                    else
-                    {
-                        MethodReference methodRef = new MethodReference()
+                            if (!resolvedMethod.IsStatic) newOpcode = 0xB9;
+                            InterfaceMethodReference methodRef = new InterfaceMethodReference()
+                            {
+                                classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
+                                nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
+                            };
+                            newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
+                            newArgs = [newArgs[0], newArgs[1], (byte)(resolvedMethod.GetParameters().Length + 1), 0];
+                        }
+                        else
                         {
-                            classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
-                            nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
+                            MethodReference methodRef = new MethodReference()
+                            {
+                                classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
+                                nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
+                            };
+                            newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
+                        }
+                        foreach (var param in resolvedMethod.GetParameters()) stack.Pop();
+                        if (resolvedMethod is MethodInfo && (resolvedMethod as MethodInfo).ReturnType != typeof(void))
+                        {
+                            stack.Push((resolvedMethod as MethodInfo).ReturnType.Name);
+                            stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                            debug += " +sp";
+                        }
+                        i += 4;
+                        break;
+                    case Opcodes.ret:
+                        if (returnType == "Int32") newOpcode = 0xAC;
+                        else if (returnType == "Int64") newOpcode = 0xAD;
+                        else if (returnType == "Single") newOpcode = 0xAE;
+                        else if (returnType == "Double") newOpcode = 0xAF;
+                        else if (returnType == "Void") newOpcode = 0xB1;
+                        else newOpcode = 0xB0;
+                        break;
+                    case Opcodes.br_s:
+                        newOpcode = 0xA7;
+                        args = [ilcode[i + 1], 0];
+                        newArgs = args;
+                        break;
+                    case Opcodes.add:
+                        item = stack.Pop();
+                        stack.Pop();
+                        if (item == "Int32") newOpcode = 0x60;
+                        if (item == "Int64") newOpcode = 0x61;
+                        if (item == "Single") newOpcode = 0x62;
+                        if (item == "Double") newOpcode = 0x63;
+                        stack.Push(item);
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        break;
+                    case Opcodes.conv_i4:
+                        item = stack.Pop();
+                        if (item == "Int64") newOpcode = 0x88;
+                        if (item == "Single") newOpcode = 0x8B;
+                        if (item == "Double") newOpcode = 0x8E;
+                        stack.Push("Int32");
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        break;
+                    case Opcodes.box:
+                        newOpcode = 0xB8;
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        Type type = module.ResolveType(BitConverter.ToInt32(args));
+                        MethodReference _methodRef = new MethodReference()
+                        {
+                            classRef = new ClassReference() { name = ConvertBuiltinName(type) },
+                            nameTypeDesc = new NameTypeReference() { name = "valueOf", descriptor = $"({TypeToLetter(type)})L{ConvertBuiltinName(type)};" }
                         };
-                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
-                    }
-                    if (resolvedMethod is MethodInfo && (resolvedMethod as MethodInfo).ReturnType != typeof(void))
-                        stack.Push((resolvedMethod as MethodInfo).ReturnType.Name);
-                    i += 4;
-                    break;
-                case Opcodes.ret:
-                    if (returnType == "Int32") newOpcode = 0xAC;
-                    else if (returnType == "Int64") newOpcode = 0xAD;
-                    else if (returnType == "Single") newOpcode = 0xAE;
-                    else if (returnType == "Double") newOpcode = 0xAF;
-                    else if (returnType == "Void") newOpcode = 0xB1;
-                    else newOpcode = 0xB0;
-                    break;
-                case Opcodes.br_s:
-                    newOpcode = 0xA7;
-                    args = [ilcode[i + 1], 0];
-                    newArgs = args;
-                    break;
-                case Opcodes.add:
-                    item = stack.Pop();
-                    stack.Pop();
-                    if (item == "Int32") newOpcode = 0x60;
-                    if (item == "Int64") newOpcode = 0x61;
-                    if (item == "Single") newOpcode = 0x62;
-                    if (item == "Double") newOpcode = 0x63;
-                    stack.Push(item);
-                    break;
-                case Opcodes.conv_i4:
-                    item = stack.Pop();
-                    if (item == "Int64") newOpcode = 0x88;
-                    if (item == "Single") newOpcode = 0x8B;
-                    if (item == "Double") newOpcode = 0x8E;
-                    stack.Push("Int32");
-                    break;
-                case Opcodes.box:
-                    newOpcode = 0xB8;
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    Type type = module.ResolveType(BitConverter.ToInt32(args));
-                    MethodReference _methodRef = new MethodReference()
-                    {
-                        classRef = new ClassReference() { name = ConvertBuiltinName(type) },
-                        nameTypeDesc = new NameTypeReference() { name = "valueOf", descriptor = $"({TypeToLetter(type)})L{ConvertBuiltinName(type)};" }
-                    };
-                    newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(_methodRef)));
-                    debug = ConvertBuiltinName(type) + ".valueof";
-                    i += 4;
-                    break;
-                case Opcodes.newobj:
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    Type resolvedType = module.ResolveMethod(BitConverter.ToInt32(args)).DeclaringType;
-                    newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new ClassReference() { name = ConvertBuiltinName(resolvedType) })));
-                    newOpcode = 0xBB;
-                    stack.Push("Reference");
-                    i += 4;
-                    break;
-                case Opcodes.stfld:
-                    args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
-                    FieldInfo resolvedField = module.ResolveField(BitConverter.ToInt32(args));
-                    newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new FieldReference()
-                    {
-                        classRef = new ClassReference { name = GetClassName(resolvedField.DeclaringType) },
-                        nameTypeDesc = new NameTypeReference { name = resolvedField.Name, descriptor = TypeToLetter(resolvedField.FieldType) }
-                    })));
-                    newOpcode = 0xB5;
-                    i += 4;
-                    break;
-                default:
-                    if (logLevel == LogLevel.Full)
-                    {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.Error.WriteLine($"      Unimplemented opcode: {BitConverter.ToString([(byte)opcode])}");
-                        Console.ForegroundColor = ConsoleColor.White;
-                    }
-                    valid = false;
-                    break;
+                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(_methodRef)));
+                        debug = ConvertBuiltinName(type) + ".valueof";
+                        i += 4;
+                        break;
+                    case Opcodes.newobj:
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        Type resolvedType = module.ResolveMethod(BitConverter.ToInt32(args)).DeclaringType;
+                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new ClassReference() { name = ConvertBuiltinName(resolvedType) })));
+                        MethodReference _evenMoreMethodRef = new MethodReference()
+                        {
+                            classRef = new ClassReference() { name = ConvertBuiltinName(resolvedType) },
+                            nameTypeDesc = new NameTypeReference() { name = "<init>", descriptor = GetMethodDescriptor(resolvedType.GetConstructors()[0]) }
+                        };
+                        debug = ConvertBuiltinName(resolvedType);
+                        stack.Push(resolvedType.Name);
+                        // java is stupid and requires manual constructor invocation
+                        int paramCount = resolvedType.GetConstructors()[0].GetParameters().Length;
+                        if (paramCount == 0)
+                        {
+                            newArgs = newArgs.Concat([(byte)0x59, (byte)0xB7]).Concat(BitConverter.GetBytes(FlipBytes(AddToConstants(_evenMoreMethodRef)))).ToArray();
+                            newOpcode = 0xBB;
+                            stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                            debug += " +sp";
+                        }
+                        else
+                        {
+                            byte[] stupidCrap = [0xBB];
+                            stupidCrap = stupidCrap.Concat(newArgs).ToArray();
+                            stupidCrap = stupidCrap.Concat([(byte)0x59]).ToArray();
+                            bytecode.InsertRange(
+                                stackpoints.Last(sp => sp.ji < ji && sp.depth == oldStack - paramCount - 1).ji,
+                                stupidCrap);
+                            newOpcode = 0xB7;
+                            newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(_evenMoreMethodRef)));
+                            foreach (var param in resolvedType.GetConstructors()[0].GetParameters()) stack.Pop();
+                        }
+                        maxStack++;
+                        i += 4;
+                        break;
+                    case Opcodes.stfld:
+                    case Opcodes.stsfld:
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        resolvedField = module.ResolveField(BitConverter.ToInt32(args));
+                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new FieldReference()
+                        {
+                            classRef = new ClassReference { name = GetClassName(resolvedField.DeclaringType) },
+                            nameTypeDesc = new NameTypeReference { name = GetFieldName(resolvedField), descriptor = TypeToLetter(resolvedField.FieldType) }
+                        })));
+                        newOpcode = resolvedField.IsStatic ? (byte)0xB3 : (byte)0xB5;
+                        stack.Pop();
+                        stack.Pop();
+                        debug = GetFieldName(resolvedField);
+                        i += 4;
+                        break;
+                    case Opcodes.ldfld:
+                    case Opcodes.ldsfld:
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        resolvedField = module.ResolveField(BitConverter.ToInt32(args));
+                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new FieldReference()
+                        {
+                            classRef = new ClassReference { name = GetClassName(resolvedField.DeclaringType) },
+                            nameTypeDesc = new NameTypeReference { name = GetFieldName(resolvedField), descriptor = TypeToLetter(resolvedField.FieldType) }
+                        })));
+                        newOpcode = resolvedField.IsStatic ? (byte)0xB2 : (byte)0xB4;
+                        debug = GetFieldName(resolvedField);
+                        stack.Push(resolvedField.FieldType.Name);
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        i += 4;
+                        break;
+                    default:
+                        if (logLevel == LogLevel.Full)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Yellow;
+                            Console.Error.WriteLine($"      Unimplemented opcode: {BitConverter.ToString([(byte)opcode])}");
+                            Console.ForegroundColor = ConsoleColor.White;
+                        }
+                        valid = false;
+                        break;
+                }
             }
+            catch (Exception error)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                foreach (var sp in stackpoints) Console.WriteLine(sp.ji + " " + sp.depth);
+                throw error;
+            }
+            ji += 1 + newArgs.Length;
             if (valid)
             {
                 bytecode.Add(newOpcode);
                 foreach (byte arg in newArgs) bytecode.Add(arg);
                 if (logLevel == LogLevel.Full)
                 {
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    Console.Write($"        {oldStack}:{stack.Count} ");
                     Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.Write($"        {Enum.GetName(opcode)}{(args.Length > 0 ? " " : "")}{BitConverter.ToString(args)}");
+                    Console.Write($"{Enum.GetName(opcode)}{(args.Length > 0 ? " " : "")}{BitConverter.ToString(args)}");
                     Console.ForegroundColor = ConsoleColor.White;
                     Console.Write(" > ");
                     Console.ForegroundColor = ConsoleColor.DarkRed;
@@ -626,9 +764,10 @@ internal class JavaClass
                     Console.Write($"{(debug.Length > 0 ? " (" : "")}{debug}{(debug.Length > 0 ? ")" : "")}\n");
                     Console.ForegroundColor = ConsoleColor.White;
                 }
+                oldStack = stack.Count;
             }
         }
-        return bytecode.ToArray();
+        return new ConvertedMethod { code = bytecode.ToArray(), maxStack = maxStack };
     }
 
     internal string TypeToLetter(Type type)
@@ -675,20 +814,30 @@ internal class JavaClass
             "Int64" => "java/lang/Long",
             "Int16" => "java/lang/Short",
             "String" => "java/lang/String",
+            "Object" => "java/lang/Object",
             _ => GetClassName(type)
         };
     }
 
     internal void WriteClassFile(Stream stream)
     {
+        if (logLevel == LogLevel.Full)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine(originalType.FullName);
+        }
         var writer = new EndianBinaryWriter(stream, endianness: Endianness.BigEndian);
         writer.WriteUInt32(0xCAFEBABE); // magic number
         writer.WriteUInt32(52); // major version
         writer.WriteUInt16((ushort)(constants.Count + 1)); // constant pool count
+        ushort i = 0;
         foreach (object constant in constants)
         {
             if (logLevel == LogLevel.Full)
             {
+                Console.ForegroundColor = ConsoleColor.Gray;
+                Console.Write(BitConverter.ToString(BitConverter.GetBytes(FlipBytes((ushort)(i + 1)))) + ": ");
+                Console.ForegroundColor = ConsoleColor.White;
                 Console.Write(constant.ToString() + " : ");
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.Write(constant.GetType().Name + "\n");
@@ -746,8 +895,9 @@ internal class JavaClass
                 writer.WriteUInt16((ushort)(constants.IndexOf(reference.name) + 1));
                 writer.WriteUInt16((ushort)(constants.IndexOf(reference.descriptor) + 1));
             }
+            i++;
         }
-        writer.WriteUInt16(0b00100001); // access flags
+        writer.WriteUInt16(0x0020 | 0x0001); // access flags
         writer.WriteUInt16(2); // this class index
         writer.WriteUInt16(4); // super class index
         writer.WriteUInt16((ushort)interfaces.Count);
@@ -807,15 +957,15 @@ internal class JavaArchive
     {
         using (var file = new FileStream(path, FileMode.OpenOrCreate))
         {
-            using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+            using (var archive = new ZipArchive(file, ZipArchiveMode.Update))
             {
                 foreach (JavaClass clazz in classes)
                 {
-                    ZipArchiveEntry entry = archive.CreateEntry(clazz.originalType.FullName.Replace(".", "/") + ".class");
+                    ZipArchiveEntry entry = archive.CreateEntry(clazz.originalType.FullName.Replace(".", "/") + ".class", CompressionLevel.Fastest);
                     using (Stream stream = entry.Open())
                         clazz.WriteClassFile(stream);
                 }
-                ZipArchiveEntry manifest = archive.CreateEntry("META-INF/MANIFEST.MF");
+                ZipArchiveEntry manifest = archive.CreateEntry("META-INF/MANIFEST.MF", CompressionLevel.Fastest);
                 using (Stream stream = manifest.Open())
                 {
                     stream.Write(Encoding.ASCII.GetBytes(
@@ -823,7 +973,7 @@ internal class JavaArchive
                         "Fabric-Jar-Type: classes\n" +
                         "Fabric-Minecraft-Version: " + mcVersion));
                 }
-                ZipArchiveEntry modJson = archive.CreateEntry("fabric.mod.json");
+                ZipArchiveEntry modJson = archive.CreateEntry("fabric.mod.json", CompressionLevel.Fastest);
                 using (Stream stream = modJson.Open())
                 {
                     stream.Write(Encoding.ASCII.GetBytes(

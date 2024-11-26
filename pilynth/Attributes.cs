@@ -1,6 +1,6 @@
 namespace Pilynth.Attributes;
 
-[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Interface, AllowMultiple = false)]
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Interface | AttributeTargets.Field | AttributeTargets.Property, AllowMultiple = false)]
 public class JavaBindAttribute : Attribute
 {
     public readonly string name;
@@ -16,3 +16,6 @@ public class YarnBindAttribute : Attribute
 
 [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
 public class EntryPointAttribute : Attribute { }
+
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+public class NoStackpoint : Attribute { }

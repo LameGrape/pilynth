@@ -43,3 +43,12 @@ public interface Logger
     [JavaBind("org.slf4j.Logger.info")]
     public void Info(string message);
 }
+
+[JavaBind("net.minecraft.class_2960")]
+public class Identifier
+{
+    [JavaBind("net.minecraft.class_2960.method_60655")]
+    public static Identifier of(string ns, string id) { return new Identifier(); }
+    [JavaBind("net.minecraft.class_2960.method_60654")]
+    public static Identifier of(string id) { return new Identifier(); }
+}
