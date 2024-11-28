@@ -1,13 +1,13 @@
 # Pilynth - Minecraft modding in C#
 ![NuGet Version](https://img.shields.io/nuget/v/Pilynth?logo=nuget&color=blue)
-![Example Repo](https://img.shields.io/badge/example%20repo-grey?logo=github&link=https%3A%2F%2Fgithub.com%2FLameGrape%2Fpilynth-example)
+![Example Repo](https://img.shields.io/badge/example-pilynth--example-%230d1117?logo=github)
 
 Pilynth is a library which enables you to write Minecraft mods entirely in C#. It transpiles the CIL bytecode of your project into Java bytecode, and wraps it all up into a JAR, ready to run.
 
 It is very much in the alpha phase, and probably not ready for much more than the most basic mods.
 
 ## Usage
-Pilynth is available as a NuGet package for .NET 8.
+Pilynth is available as a [NuGet package](https://www.nuget.org/packages/Pilynth) for .NET 8. A ready to run example project can be found in its [own repository](https://github.com/LameGrape/pilynth-example).
 
 To create a mod, pass the command line arguments into a new instance of `Mod`, and include a class that inherits `FabricMod` in the assembly. The `Identifier` and `Version` attributes must also be used, the former which will be used as the mod namespace. 
 ```cs
