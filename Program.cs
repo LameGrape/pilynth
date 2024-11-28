@@ -318,7 +318,7 @@ internal class JavaClass
         if (yarnBind != null)
         {
             if (!yarnBind.useNativeName) return yarnBind.name;
-            return GetClassName(type.DeclaringType) + "." + type.Name;
+            return GetClassBindName(type.DeclaringType) + "." + type.Name;
         }
         return type.FullName;
     }
