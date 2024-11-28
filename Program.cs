@@ -1,4 +1,4 @@
-﻿#pragma warning disable CS8602, CS8600, CS8604, CS8605, CS0649
+﻿#pragma warning disable CS8602, CS8600, CS8604, CS8605, CS0649, CS8603
 
 using System.IO.Compression;
 using System.Reflection;
@@ -20,6 +20,8 @@ public class Mod
             return;
         }
         string mcVersion = args[0];
+
+        Console.WriteLine($"Building mod for {mcVersion}");
 
         YarnMappings.PrepareMappings(mcVersion);
 
@@ -58,41 +60,88 @@ public class Mod
 
 internal class YarnMappings
 {
+    internal static string[]? mappings;
+    internal static Dictionary<string, string> cache = new();
+    internal static Dictionary<string, string> classCache = new();
+
     internal static void PrepareMappings(string version)
     {
+        if (!Directory.Exists("yarn")) Directory.CreateDirectory("yarn");
+        if (File.Exists($"yarn/{version}.yarn"))
+        {
+            Console.WriteLine($"Found existing yarn mappings for current version");
+            mappings = File.ReadAllLines($"yarn/{version}.yarn");
+            return;
+        }
+        Console.WriteLine("Fetching latest mappings for current version");
         XDocument metadata = XDocument.Load("https://maven.fabricmc.net/net/fabricmc/yarn/maven-metadata.xml");
         string yarnVersion = metadata.Descendants("version").Last(element => element.Value.StartsWith(version)).Value;
-        System.Console.WriteLine(yarnVersion);
-    } // TODO: download mappings for the specified version instead of being hardcoded
 
-    // internal static void GetMapping(string path, string type)
-    // {
-    //     string[] split = path.Split();
-    //     string combined = "yarn/";
-    //     foreach (string segment in split)
-    //     {
-    //         if (File.Exists(combined + segment + ".mapping"))
-    //     }
-    // }
+        Console.WriteLine($"Downloading and decompressing yarn {yarnVersion} mappings");
+        using (var client = new HttpClient())
+        using (var stream = client.Send(
+            new HttpRequestMessage(HttpMethod.Get, $"https://maven.fabricmc.net/net/fabricmc/yarn/{yarnVersion}/yarn-{yarnVersion}-tiny.gz"
+            )).Content.ReadAsStream())
+        using (var gzip = new GZipStream(stream, CompressionMode.Decompress))
+        using (var file = new FileStream($"yarn/{version}.yarn", FileMode.Create))
+            gzip.CopyTo(file);
 
-    internal static string ConvertMethod(string method)
-    {
-        string[] split = method.Split(".");
-        string clazz = string.Join('/', split.AsSpan(0, split.Length - 1).ToArray()) + ".mapping";
-        if (!File.Exists("yarn/" + clazz)) return method; // i dont know what to tell you buddy the method doesnt exist
-        string[] file = File.ReadAllLines("yarn/" + clazz);
-        string mojangClass = file[0].Split(" ")[1];
-        string mojangMethod = file.First(line => line.Trim().Split(" ")[2] == split.Last()).Split(" ")[1];
-        return mojangClass + "/" + mojangMethod;
+        mappings = File.ReadAllLines($"yarn/{version}.yarn");
     }
 
-    internal static string ConvertClass(string clazz)
+    internal static string ConvertClass(string path, bool mojangClasses = false)
     {
-        clazz = clazz.Replace(".", "/") + ".mapping";
-        if (!File.Exists("yarn/" + clazz)) return clazz; // i dont know what to tell you buddy the ~~method~~ class doesnt exist
-        string[] file = File.ReadAllLines("yarn/" + clazz);
-        string mojangClass = file[0].Split(" ")[1];
-        return mojangClass;
+        if (cache.ContainsKey(path)) return mojangClasses ? classCache[path] : cache[path];
+        string mapped = mappings.First(mapping =>
+        {
+            string[] split = mapping.Split();
+            return split[0] == "CLASS" && split.Last().Replace("/", ".").Replace("$", ".") == path;
+        });
+        cache.Add(path, mapped.Split()[mapped.Split().Length - 2]);
+        classCache.Add(path, mapped.Split()[1]);
+        return mojangClasses ? classCache[path] : cache[path];
+    }
+
+    internal static string ConvertMethod(MethodBase method)
+    {
+        var yarnBind = method.GetCustomAttribute<YarnBindAttribute>();
+        string path = yarnBind.useNativeName ?
+            JavaClass.GetClassBindName(method.DeclaringType) + "." + method.Name :
+            yarnBind.name;
+        string[] pathSplit = path.Split(".");
+        string descriptor = JavaClass.GetMethodDescriptor(method);
+        if (cache.ContainsKey(path + descriptor)) return cache[path + descriptor];
+        if (!classCache.ContainsKey(JavaClass.GetClassBindName(method.DeclaringType))) JavaClass.GetClassName(method.DeclaringType);
+        string mapped = mappings.First(mapping =>
+        {
+            string[] split = mapping.Split();
+            return split[0] == "METHOD"
+                && pathSplit.Last() == split.Last()
+                && classCache[JavaClass.GetClassBindName(method.DeclaringType)] == split[1]
+                && JavaClass.GetMethodDescriptor(method, true) == split[2];
+        });
+        cache.Add(path + descriptor, mapped.Split()[mapped.Split().Length - 2]);
+        return cache[path + descriptor];
+    }
+
+    internal static string ConvertField(FieldInfo field)
+    {
+        var yarnBind = field.GetCustomAttribute<YarnBindAttribute>();
+        string path = yarnBind.useNativeName ?
+            JavaClass.GetClassBindName(field.DeclaringType) + "." + field.Name :
+            yarnBind.name;
+        string[] pathSplit = path.Split(".");
+        if (cache.ContainsKey(path)) return cache[path];
+        if (!classCache.ContainsKey(JavaClass.GetClassBindName(field.DeclaringType))) JavaClass.GetClassName(field.DeclaringType);
+        string mapped = mappings.First(mapping =>
+        {
+            string[] split = mapping.Split();
+            return split[0] == "FIELD"
+                && pathSplit.Last() == split.Last()
+                && classCache[JavaClass.GetClassBindName(field.DeclaringType)] == split[1];
+        });
+        cache.Add(path, mapped.Split()[mapped.Split().Length - 2]);
+        return cache[path];
     }
 }
 
@@ -243,47 +292,47 @@ internal class JavaClass
         JavaBindAttribute bind = method.GetCustomAttribute<JavaBindAttribute>();
         if (bind != null) return bind.name.Split(".").Last();
         YarnBindAttribute yarnBind = method.GetCustomAttribute<YarnBindAttribute>();
-        if (yarnBind != null) return YarnMappings.ConvertMethod(yarnBind.name.Split("/").Last());
+        if (yarnBind != null) return YarnMappings.ConvertMethod(method);
         if (method.Name == ".ctor") return "<init>";
         return method.Name;
     }
 
-    internal string GetMethodClass(MethodBase method)
-    {
-        JavaBindAttribute bind = method.GetCustomAttribute<JavaBindAttribute>();
-        if (bind != null)
-        {
-            string[] fullName = bind.name.Split(".");
-            return string.Join("/", fullName.AsSpan(0, fullName.Length - 1).ToArray());
-        }
-        YarnBindAttribute yarnBind = method.GetCustomAttribute<YarnBindAttribute>();
-        if (yarnBind != null)
-        {
-            string[] fullName = yarnBind.name.Split("/");
-            return string.Join("/", fullName.AsSpan(0, fullName.Length - 1).ToArray());
-        }
-        return ConvertBuiltinName(method.DeclaringType);
-    }
-
-    internal string GetClassName(Type type)
+    internal static string GetClassName(Type type, bool mojangClasses = false)
     {
         JavaBindAttribute bind = type.GetCustomAttribute<JavaBindAttribute>(false);
         if (bind != null) return bind.name.Replace(".", "/");
         YarnBindAttribute yarnBind = type.GetCustomAttribute<YarnBindAttribute>(false);
-        if (yarnBind != null) return YarnMappings.ConvertClass(yarnBind.name);
+        if (yarnBind != null)
+        {
+            if (!yarnBind.useNativeName) return YarnMappings.ConvertClass(yarnBind.name, mojangClasses);
+            return YarnMappings.ConvertClass(GetClassName(type.DeclaringType) + "." + type.Name, mojangClasses);
+        }
         return type.FullName.Replace(".", "/");
     }
 
-    internal string GetFieldName(FieldInfo field)
+    internal static string GetClassBindName(Type type)
+    {
+        JavaBindAttribute bind = type.GetCustomAttribute<JavaBindAttribute>(false);
+        if (bind != null) return bind.name;
+        YarnBindAttribute yarnBind = type.GetCustomAttribute<YarnBindAttribute>(false);
+        if (yarnBind != null)
+        {
+            if (!yarnBind.useNativeName) return yarnBind.name;
+            return GetClassName(type.DeclaringType) + "." + type.Name;
+        }
+        return type.FullName;
+    }
+
+    internal static string GetFieldName(FieldInfo field)
     {
         JavaBindAttribute bind = field.GetCustomAttribute<JavaBindAttribute>();
         if (bind != null) return bind.name.Replace(".", "/");
         YarnBindAttribute yarnBind = field.GetCustomAttribute<YarnBindAttribute>();
-        if (yarnBind != null) return YarnMappings.ConvertClass(yarnBind.name);
+        if (yarnBind != null) return YarnMappings.ConvertField(field);
         return field.Name;
     }
 
-    internal ushort FlipBytes(ushort number)
+    internal static ushort FlipBytes(ushort number)
     {
         return BitConverter.ToUInt16(BitConverter.GetBytes(number).Reverse().ToArray());
     }
@@ -319,7 +368,7 @@ internal class JavaClass
         Enum = 0x4000
     }
 
-    internal MethodAccessFlags GetMethodAccessFlags(MethodBase method)
+    internal static MethodAccessFlags GetMethodAccessFlags(MethodBase method)
     {
         MethodAccessFlags flags = 0;
         if (method.IsPublic) flags |= MethodAccessFlags.Public;
@@ -329,7 +378,7 @@ internal class JavaClass
         if (method.IsAbstract) flags |= MethodAccessFlags.Abstract;
         return flags;
     }
-    internal FieldAccessFlags GetFieldAccessFlags(FieldInfo field)
+    internal static FieldAccessFlags GetFieldAccessFlags(FieldInfo field)
     {
         FieldAccessFlags flags = 0;
         if (field.IsPublic || field.DeclaringType.IsInterface) flags |= FieldAccessFlags.Public;
@@ -612,7 +661,7 @@ internal class JavaClass
                             if (!resolvedMethod.IsStatic) newOpcode = 0xB9;
                             InterfaceMethodReference methodRef = new InterfaceMethodReference()
                             {
-                                classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
+                                classRef = new ClassReference { name = ConvertBuiltinName(resolvedMethod.DeclaringType) },
                                 nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
                             };
                             newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
@@ -622,7 +671,7 @@ internal class JavaClass
                         {
                             MethodReference methodRef = new MethodReference()
                             {
-                                classRef = new ClassReference { name = GetMethodClass(resolvedMethod) },
+                                classRef = new ClassReference { name = ConvertBuiltinName(resolvedMethod.DeclaringType) },
                                 nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
                             };
                             newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
@@ -723,7 +772,7 @@ internal class JavaClass
                         resolvedField = module.ResolveField(BitConverter.ToInt32(args));
                         newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new FieldReference()
                         {
-                            classRef = new ClassReference { name = GetClassName(resolvedField.DeclaringType) },
+                            classRef = new ClassReference { name = ConvertBuiltinName(resolvedField.DeclaringType) },
                             nameTypeDesc = new NameTypeReference { name = GetFieldName(resolvedField), descriptor = TypeToLetter(resolvedField.FieldType) }
                         })));
                         newOpcode = resolvedField.IsStatic ? (byte)0xB3 : (byte)0xB5;
@@ -738,7 +787,7 @@ internal class JavaClass
                         resolvedField = module.ResolveField(BitConverter.ToInt32(args));
                         newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new FieldReference()
                         {
-                            classRef = new ClassReference { name = GetClassName(resolvedField.DeclaringType) },
+                            classRef = new ClassReference { name = ConvertBuiltinName(resolvedField.DeclaringType) },
                             nameTypeDesc = new NameTypeReference { name = GetFieldName(resolvedField), descriptor = TypeToLetter(resolvedField.FieldType) }
                         })));
                         newOpcode = resolvedField.IsStatic ? (byte)0xB2 : (byte)0xB4;
@@ -762,7 +811,7 @@ internal class JavaClass
             catch
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                foreach (var sp in stackpoints) Console.WriteLine(sp.ji + " " + sp.depth);
+                Console.WriteLine($"Error in opcode: {opcode} ({debug})");
                 throw;
             }
             ji += 1 + newArgs.Length;
@@ -790,7 +839,7 @@ internal class JavaClass
         return new ConvertedMethod { code = bytecode.ToArray(), maxStack = maxStack };
     }
 
-    internal string TypeToLetter(Type type)
+    internal static string TypeToLetter(Type type, bool mojangClasses = false)
     {
         return type.Name switch
         {
@@ -804,12 +853,12 @@ internal class JavaClass
             "Int16" => "S",
             "Void" => "V",
             "Object" => "Ljava/lang/Object;",
-            _ => (type.IsArray ? "[" : "") + "L" + ConvertBuiltinName(type).Replace(".", "/").Replace("[]", "") + ";"
+            _ => (type.IsArray ? "[" : "") + "L" + ConvertBuiltinName(type, mojangClasses).Replace(".", "/").Replace("[]", "") + ";"
 
         };
     }
 
-    internal string GetMethodDescriptor(MethodBase method)
+    internal static string GetMethodDescriptor(MethodBase method, bool mojangClasses = false)
     {
         ParameterInfo[] parameters = method.GetParameters();
         string descriptor = "(";
@@ -817,13 +866,13 @@ internal class JavaClass
         {
             Type type = parameter.ParameterType;
             if (type is null) continue;
-            descriptor += TypeToLetter(type);
+            descriptor += TypeToLetter(type, mojangClasses);
         }
-        descriptor += ")" + TypeToLetter(method is MethodInfo ? (method as MethodInfo).ReturnType : typeof(void));
+        descriptor += ")" + TypeToLetter(method is MethodInfo ? (method as MethodInfo).ReturnType : typeof(void), mojangClasses);
         return descriptor;
     }
 
-    internal string ConvertBuiltinName(Type type)
+    internal static string ConvertBuiltinName(Type type, bool mojangClasses = false)
     {
         if (type.FullName is null) return type.Name;
         return type.Name.Replace("[]", "") switch
@@ -835,7 +884,7 @@ internal class JavaClass
             "Int16" => "java/lang/Short",
             "String" => "java/lang/String",
             "Object" => "java/lang/Object",
-            _ => GetClassName(type)
+            _ => GetClassName(type, mojangClasses)
         };
     }
 

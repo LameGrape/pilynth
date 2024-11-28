@@ -1,3 +1,5 @@
+#pragma warning disable CS8603
+
 using Pilynth.Attributes;
 
 namespace Pilynth.Fabric;
@@ -44,11 +46,11 @@ public interface Logger
     public void Info(string message);
 }
 
-[JavaBind("net.minecraft.class_2960")]
+[YarnBind("net.minecraft.util.Identifier")]
 public class Identifier
 {
-    [JavaBind("net.minecraft.class_2960.method_60655")]
-    public static Identifier of(string ns, string id) { return new Identifier(); }
-    [JavaBind("net.minecraft.class_2960.method_60654")]
-    public static Identifier of(string id) { return new Identifier(); }
+    [YarnBind]
+    public extern static Identifier of(string ns, string id);
+    [YarnBind]
+    public extern static Identifier of(string id);
 }

@@ -7,15 +7,14 @@ public class JavaBindAttribute : Attribute
     public JavaBindAttribute(string name) { this.name = name; }
 }
 
-[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Interface, AllowMultiple = false)]
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Interface | AttributeTargets.Field, AllowMultiple = false)]
 public class YarnBindAttribute : Attribute
 {
-    public readonly string name;
+    public readonly string name = "";
+    public readonly bool useNativeName = false;
     public YarnBindAttribute(string name) { this.name = name; }
+    public YarnBindAttribute() { useNativeName = true; }
 }
 
 [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
 public class EntryPointAttribute : Attribute { }
-
-[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
-public class NoStackpoint : Attribute { }
