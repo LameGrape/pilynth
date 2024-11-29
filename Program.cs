@@ -28,7 +28,7 @@ public class Mod
         Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
         List<JavaClass> classes = new();
         string identifier = "", version = "", entrypoint = "";
-        JavaClass entryClass;
+        JavaClass entryClass = null;
 
         JavaClass.LogLevel logLevel = JavaClass.LogLevel.None;
         if (args.Length > 1 && args[1].StartsWith("--"))
@@ -39,6 +39,7 @@ public class Mod
             if (args[1].Contains("i")) logLevel |= JavaClass.LogLevel.Internals;
         }
 
+        List<Type> items = new();
         foreach (Type type in types)
         {
             JavaClass clazz = new JavaClass(type, logLevel);
@@ -50,12 +51,38 @@ public class Mod
                 entrypoint = type.FullName;
                 entryClass = clazz;
             }
+            if (typeof(Item).IsAssignableFrom(type)) items.Add(type);
         }
+
+        entryClass.HandleMethod(typeof(Mod).GetMethod("_RegisterItem", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
+
+        foreach (Type item in items)
+        {
+            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(Mod), "_RegisterItem", 3);
+            methodRef.classRef = JavaClass.GetClassReference(entryClass.originalType);
+            entryClass.ExtendInitializeMethod(JavaClass.StringToBytes(
+                "2A"
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(JavaClass.GetClassReference(item))])}"""
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(new JavaClass.StringReference { text = identifier })])}"""
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(new JavaClass.StringReference { text = item.GetCustomAttribute<IdentifierAttribute>().identifier })])}"""
+                + $"""B6{BitConverter.ToString(BitConverter.GetBytes(JavaClass.FlipBytes(entryClass.AddToConstants(methodRef))))}"""
+                + "B1"
+            ), 4);
+        }
+
         JavaArchive jar = new JavaArchive(identifier, version, entrypoint, mcVersion, classes.ToArray());
         if (!Directory.Exists("build")) Directory.CreateDirectory("build");
         Console.WriteLine($"Exporting to build/{identifier}-v{version}-{mcVersion}.jar");
         jar.WriteJarFile($"build/{identifier}-v{version}-{mcVersion}.jar");
     }
+
+    internal void _RegisterItem(Java.Class type, string ns, string id)
+    {
+        RegistryKey key = RegistryKey.of(RegistryKey.ofRegistry(Identifier.of("item")), Identifier.of(ns, id));
+        object instance = type.GetConstructor([typeof(Item.Settings)]).NewInstance([new Item.Settings().registryKey(key)]);
+        Registry.register(Registries.ITEM, key, instance);
+    }
+
 }
 
 internal class YarnMappings
@@ -219,13 +246,13 @@ internal class JavaClass
         internal ushort maxStack;
     }
 
-    internal void HandleMethod(MethodBase method, Type type)
+    internal void HandleMethod(MethodBase method, Type type, bool synthetic = false)
     {
-        if (method.DeclaringType != type) return;
+        if (method.DeclaringType != type && !synthetic) return;
         if (logLevel.HasFlag(LogLevel.Internals) || logLevel.HasFlag(LogLevel.Bytecode))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"    Method {method.DeclaringType}.{method.Name}");
+            Console.WriteLine($"    Method {type}.{method.Name}");
             Console.ForegroundColor = ConsoleColor.White;
         }
 
@@ -235,7 +262,7 @@ internal class JavaClass
         string descriptor = GetMethodDescriptor(method);
         JavaMethod javaMethod = new JavaMethod
         {
-            accessFlags = GetMethodAccessFlags(method),
+            accessFlags = GetMethodAccessFlags(method, synthetic),
             nameIndex = AddToConstants(name),
             descriptorIndex = AddToConstants(descriptor)
         };
@@ -286,7 +313,19 @@ internal class JavaClass
         return (ushort)(constants.IndexOf(item) + 1);
     }
 
-    internal string GetMethodName(MethodBase method)
+    internal void ExtendInitializeMethod(byte[] extension, ushort maxStack)
+    {
+        foreach (JavaMethod method in methods)
+        {
+            if (((string)constants[method.nameIndex - 1]) != "onInitialize") return;
+            method.codeAttribute.maxStack = Math.Max(maxStack, method.codeAttribute.maxStack);
+            method.codeAttribute.code = method.codeAttribute.code.AsSpan(0, method.codeAttribute.code.Length - 1).ToArray().Concat(extension).ToArray();
+            method.codeAttribute.codeLength = (uint)method.codeAttribute.code.Length;
+            method.codeAttribute.length = (uint)(2 * 2 + 4 * 2 + method.codeAttribute.code.Length);
+        }
+    }
+
+    internal static string GetMethodName(MethodBase method)
     {
         if (method.GetCustomAttribute<EntryPointAttribute>() != null) return "main";
         JavaBindAttribute bind = method.GetCustomAttribute<JavaBindAttribute>();
@@ -332,9 +371,50 @@ internal class JavaClass
         return field.Name;
     }
 
+    internal static MethodReference GetMethodReference(Type type, string method, int paramCount)
+    {
+        MethodBase realMethod;
+        if (method == ".ctor") realMethod = type.GetConstructors().First(m => m.GetParameters().Length == paramCount);
+        else realMethod = type.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic).First(m => m.Name == method && m.GetParameters().Length == paramCount);
+        return new MethodReference()
+        {
+            classRef = new ClassReference { name = ConvertBuiltinName(realMethod.DeclaringType) },
+            nameTypeDesc = new NameTypeReference { name = GetMethodName(realMethod), descriptor = GetMethodDescriptor(realMethod) }
+        };
+    }
+
+    internal static FieldReference GetFieldReference(Type type, string field)
+    {
+        FieldInfo reaField = type.GetField(field);
+        return new FieldReference()
+        {
+            classRef = new ClassReference { name = ConvertBuiltinName(reaField.DeclaringType) },
+            nameTypeDesc = new NameTypeReference { name = GetFieldName(reaField), descriptor = TypeToLetter(reaField.FieldType) }
+        };
+    }
+
+    internal static ClassReference GetClassReference(Type type)
+    {
+        return new ClassReference()
+        {
+            name = GetClassName(type)
+        };
+    }
+
+    internal byte[] GetConstantBytes(object constant)
+    {
+        return BitConverter.GetBytes(FlipBytes(AddToConstants(constant)));
+    }
+
     internal static ushort FlipBytes(ushort number)
     {
         return BitConverter.ToUInt16(BitConverter.GetBytes(number).Reverse().ToArray());
+    }
+
+    internal static byte[] StringToBytes(string hex)
+    {
+        hex = hex.Replace("-", "");
+        return hex.Chunk(2).Select(x => { return Convert.ToByte(new string(x), 16); }).ToArray();
     }
 
     [Flags]
@@ -368,7 +448,7 @@ internal class JavaClass
         Enum = 0x4000
     }
 
-    internal static MethodAccessFlags GetMethodAccessFlags(MethodBase method)
+    internal static MethodAccessFlags GetMethodAccessFlags(MethodBase method, bool synthetic = false)
     {
         MethodAccessFlags flags = 0;
         if (method.IsPublic) flags |= MethodAccessFlags.Public;
@@ -376,6 +456,7 @@ internal class JavaClass
         if (method.IsFamily) flags |= MethodAccessFlags.Protected;
         if (method.IsStatic) flags |= MethodAccessFlags.Static;
         if (method.IsAbstract) flags |= MethodAccessFlags.Abstract;
+        if (synthetic) flags |= MethodAccessFlags.Synthetic;
         return flags;
     }
     internal static FieldAccessFlags GetFieldAccessFlags(FieldInfo field)
@@ -390,7 +471,7 @@ internal class JavaClass
         return flags;
     }
 
-    internal struct JavaMethod
+    internal class JavaMethod
     {
         internal MethodAccessFlags accessFlags;
         internal ushort nameIndex;
@@ -515,6 +596,18 @@ internal class JavaClass
         ldfld = 0x7B, // <int32>
         ldsfld = 0x7E, // <int32>
         pop = 0x26,
+        ldc_i4_0 = 0x16,
+        ldc_i4_1 = 0x17,
+        ldc_i4_2 = 0x18,
+        ldc_i4_3 = 0x19,
+        ldc_i4_4 = 0x1A,
+        ldc_i4_5 = 0x1B,
+        ldc_i4_6 = 0x1C,
+        ldc_i4_7 = 0x1D,
+        ldc_i4_8 = 0x1E,
+        newarr = 0x8D,
+        ldtoken = 0xD0,
+        stelem_ref = 0xA2,
     }
 
     internal struct Stackpoint
@@ -538,6 +631,7 @@ internal class JavaClass
         List<byte> bytecode = new List<byte>();
         string[] locals = new string[body.LocalVariables.Count + method.GetParameters().Length + 1];
 
+        int runtimeHandle = 0;
         int ji = 0;
 
         for (int i = 0; i < ilcode.Length; i++)
@@ -627,11 +721,25 @@ internal class JavaClass
                         newArgs = [(byte)AddToConstants(constant)];
                         i += 4;
                         break;
+                    case Opcodes.ldc_i4_0:
+                    case Opcodes.ldc_i4_1:
+                    case Opcodes.ldc_i4_2:
+                    case Opcodes.ldc_i4_3:
+                    case Opcodes.ldc_i4_4:
+                    case Opcodes.ldc_i4_5:
+                    case Opcodes.ldc_i4_6:
+                    case Opcodes.ldc_i4_7:
+                    case Opcodes.ldc_i4_8:
+                        offset = (byte)(opcode - Opcodes.ldc_i4_0);
+                        newOpcode = 0x12;
+                        stack.Push("Integer");
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        newArgs = [(byte)AddToConstants(offset)];
+                        break;
                     case Opcodes.dup:
                         newOpcode = 0x59;
                         stack.Push(stack.Peek());
-                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
-                        debug += " +sp";
                         break;
                     case Opcodes.pop:
                         newOpcode = 0x57;
@@ -656,6 +764,16 @@ internal class JavaClass
                         debug = name;
                         newOpcode = resolvedMethod.IsStatic ? (byte)0xB8 : resolvedMethod.IsPrivate || resolvedMethod.IsConstructor ? (byte)0xB7 : (byte)0xB6;
                         newOpcode = opcode == Opcodes.call ? newOpcode : (byte)0xB6;
+                        if (resolvedMethod.Name == "GetTypeFromHandle")
+                        {
+                            newOpcode = 0x12;
+                            Type resolved = module.ResolveType(runtimeHandle);
+                            newArgs = [(byte)AddToConstants(new ClassReference { name = ConvertBuiltinName(resolved) })];
+                            stack.Pop();
+                            debug = ConvertBuiltinName(resolved);
+                            i += 4;
+                            break;
+                        }
                         if (resolvedMethod.DeclaringType.IsInterface)
                         {
                             if (!resolvedMethod.IsStatic) newOpcode = 0xB9;
@@ -665,7 +783,7 @@ internal class JavaClass
                                 nameTypeDesc = new NameTypeReference { name = GetMethodName(resolvedMethod), descriptor = GetMethodDescriptor(resolvedMethod) }
                             };
                             newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
-                            newArgs = [newArgs[0], newArgs[1], (byte)(resolvedMethod.GetParameters().Length + 1), 0];
+                            if (!resolvedMethod.IsStatic) newArgs = [newArgs[0], newArgs[1], (byte)(resolvedMethod.GetParameters().Length + 1), 0];
                         }
                         else
                         {
@@ -797,6 +915,25 @@ internal class JavaClass
                         debug += " +sp";
                         i += 4;
                         break;
+                    case Opcodes.newarr:
+                        newOpcode = 0xBD;
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        resolvedType = module.ResolveType(BitConverter.ToInt32(args));
+                        newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new ClassReference { name = ConvertBuiltinName(resolvedType) })));
+                        debug = ConvertBuiltinName(resolvedType) + "[]";
+                        stack.Push("Array");
+                        stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
+                        debug += " +sp";
+                        i += 4;
+                        break;
+                    case Opcodes.ldtoken:
+                        args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
+                        runtimeHandle = BitConverter.ToInt32(args);
+                        i += 4;
+                        break;
+                    case Opcodes.stelem_ref:
+                        newOpcode = 0x53;
+                        break;
                     default:
                         if (logLevel.HasFlag(LogLevel.Bytecode))
                         {
@@ -853,6 +990,7 @@ internal class JavaClass
             "Int16" => "S",
             "Void" => "V",
             "Object" => "Ljava/lang/Object;",
+            "Type" => "Ljava/lang/Class;",
             _ => (type.IsArray ? "[" : "") + "L" + ConvertBuiltinName(type, mojangClasses).Replace(".", "/").Replace("[]", "") + ";"
 
         };
@@ -884,6 +1022,7 @@ internal class JavaClass
             "Int16" => "java/lang/Short",
             "String" => "java/lang/String",
             "Object" => "java/lang/Object",
+            "Type" => "java/lang/Class",
             _ => GetClassName(type, mojangClasses)
         };
     }
@@ -911,6 +1050,11 @@ internal class JavaClass
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.Write(constant.GetType().Name + "\n");
                 Console.ForegroundColor = ConsoleColor.White;
+            }
+            if (constant is int || constant is byte || constant is short)
+            {
+                writer.WriteByte(3);
+                writer.WriteInt32((int)constant);
             }
             if (constant is string)
             {
@@ -1034,6 +1178,13 @@ internal class JavaArchive
                     ZipArchiveEntry entry = archive.CreateEntry(clazz.originalType.FullName.Replace(".", "/") + ".class", CompressionLevel.Fastest);
                     using (Stream stream = entry.Open())
                         clazz.WriteClassFile(stream);
+                }
+                if (Directory.Exists("assets"))
+                {
+                    foreach (string assetFile in Directory.GetFiles("assets", "*", SearchOption.AllDirectories))
+                    {
+                        archive.CreateEntryFromFile(assetFile, assetFile, CompressionLevel.Fastest);
+                    }
                 }
                 ZipArchiveEntry manifest = archive.CreateEntry("META-INF/MANIFEST.MF", CompressionLevel.Fastest);
                 using (Stream stream = manifest.Open())
