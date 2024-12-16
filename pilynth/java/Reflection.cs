@@ -5,6 +5,8 @@ namespace Pilynth.Java;
 [JavaBind("java.lang.Class")]
 public class Class
 {
+    public Class(Type type) { }
+
     [JavaBind("java.lang.Class.getConstructor")]
     public extern Constructor GetConstructor(Type[] parameters);
 }

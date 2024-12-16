@@ -7,6 +7,7 @@ using Pilynth.Attributes;
 using Kermalis.EndianBinaryIO;
 using Pilynth.Fabric;
 using System.Xml.Linq;
+using System.Runtime.CompilerServices;
 
 namespace Pilynth;
 
@@ -26,7 +27,7 @@ public class Mod
         YarnMappings.PrepareMappings(mcVersion);
 
         Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
-        List<JavaClass> classes = new();
+        List<JavaClass> classes = [];
         string identifier = "", version = "", entrypoint = "";
         JavaClass entryClass = null;
 
@@ -37,9 +38,12 @@ public class Mod
             if (args[1].Contains("b")) logLevel |= JavaClass.LogLevel.Bytecode;
             if (args[1].Contains("c")) logLevel |= JavaClass.LogLevel.Classes;
             if (args[1].Contains("i")) logLevel |= JavaClass.LogLevel.Internals;
+            if (args[1].Contains("l")) logLevel |= JavaClass.LogLevel.Locals;
+            if (args[1].Contains("s")) logLevel |= JavaClass.LogLevel.Stack;
         }
 
-        List<Type> items = new();
+        List<Type> items = [];
+        List<Type> blocks = [];
         foreach (Type type in types)
         {
             JavaClass clazz = new JavaClass(type, logLevel);
@@ -52,9 +56,11 @@ public class Mod
                 entryClass = clazz;
             }
             if (typeof(Item).IsAssignableFrom(type)) items.Add(type);
+            if (typeof(Block).IsAssignableFrom(type)) blocks.Add(type);
         }
 
         entryClass.HandleMethod(typeof(Mod).GetMethod("_RegisterItem", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
+        entryClass.HandleMethod(typeof(Mod).GetMethod("_RegisterBlock", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
 
         foreach (Type item in items)
         {
@@ -69,6 +75,20 @@ public class Mod
                 + "B1"
             ), 4);
         }
+        foreach (Type block in blocks)
+        {
+            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(Mod), "_RegisterBlock", 4);
+            methodRef.classRef = JavaClass.GetClassReference(entryClass.originalType);
+            entryClass.ExtendInitializeMethod(JavaClass.StringToBytes(
+                "2A"
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(JavaClass.GetClassReference(block))])}"""
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(new JavaClass.StringReference { text = identifier })])}"""
+                + $"""12{BitConverter.ToString([(byte)entryClass.AddToConstants(new JavaClass.StringReference { text = block.GetCustomAttribute<IdentifierAttribute>().identifier })])}"""
+                + "04"
+                + $"""B6{BitConverter.ToString(BitConverter.GetBytes(JavaClass.FlipBytes(entryClass.AddToConstants(methodRef))))}"""
+                + "B1"
+            ), 5);
+        }
 
         JavaArchive jar = new JavaArchive(identifier, version, entrypoint, mcVersion, classes.ToArray());
         if (!Directory.Exists("build")) Directory.CreateDirectory("build");
@@ -82,14 +102,26 @@ public class Mod
         object instance = type.GetConstructor([typeof(Item.Settings)]).NewInstance([new Item.Settings().registryKey(key)]);
         Registry.register(Registries.ITEM, key, instance);
     }
+    internal void _RegisterBlock(Java.Class type, string ns, string id, bool withItem)
+    {
+        RegistryKey key = RegistryKey.of(RegistryKey.ofRegistry(Identifier.of("block")), Identifier.of(ns, id));
+        object instance = type.GetConstructor([typeof(Block.Settings)]).NewInstance([AbstractBlock.Settings.create().registryKey(key)]);
+        if (withItem)
+        {
+            RegistryKey itemKey = RegistryKey.of(RegistryKey.ofRegistry(Identifier.of("item")), Identifier.of(ns, id));
+            object itemInstance = new Java.Class(typeof(BlockItem)).GetConstructor([typeof(Block), typeof(Item.Settings)]).NewInstance([instance, new Item.Settings().registryKey(itemKey)]);
+            Registry.register(Registries.ITEM, itemKey, itemInstance);
+        }
+        Registry.register(Registries.BLOCK, key, instance);
+    }
 
 }
 
 internal class YarnMappings
 {
     internal static string[]? mappings;
-    internal static Dictionary<string, string> cache = new();
-    internal static Dictionary<string, string> classCache = new();
+    internal static Dictionary<string, string> cache = [];
+    internal static Dictionary<string, string> classCache = [];
 
     internal static void PrepareMappings(string version)
     {
@@ -181,15 +213,17 @@ internal class JavaClass
         ConstantPool = 1,
         Bytecode = 2,
         Internals = 4,
-        Classes = 8
+        Classes = 8,
+        Locals = 16,
+        Stack = 32,
     }
 
     internal LogLevel logLevel = LogLevel.None;
 
-    internal List<object> constants = new();
-    internal List<JavaField> fields = new();
-    internal List<JavaMethod> methods = new();
-    internal List<ushort> interfaces = new();
+    internal List<object> constants = [];
+    internal List<JavaField> fields = [];
+    internal List<JavaMethod> methods = [];
+    internal List<ushort> interfaces = [];
     internal Type originalType;
 
     internal JavaClass(Type type, LogLevel logLevel)
@@ -244,6 +278,7 @@ internal class JavaClass
     {
         internal byte[] code;
         internal ushort maxStack;
+        internal StackMapFrame[] frames;
     }
 
     internal void HandleMethod(MethodBase method, Type type, bool synthetic = false)
@@ -267,10 +302,11 @@ internal class JavaClass
             descriptorIndex = AddToConstants(descriptor)
         };
 
-        ConvertedMethod converted = ConvertMethod(method);
+        ConvertedMethod converted = ConvertMethod(method, type);
+
         CodeAttribute attribute = new CodeAttribute
         {
-            length = (uint)(2 * 2 + 4 * 2 + converted.code.Length), // 3 shorts, 2 ints, and code length
+            length = (uint)(2 + 2 + 4 + 4 + converted.code.Length), // 2 shorts, 2 ints, and code length
             maxStack = converted.maxStack,
             maxLocals = (ushort)(body.LocalVariables.Count + method.GetParameters().Length + 1),
             codeLength = (uint)converted.code.Length,
@@ -278,6 +314,18 @@ internal class JavaClass
         };
         attribute.nameIndex = AddToConstants("Code");
         javaMethod.codeAttribute = attribute;
+
+        StackMapTableAttribute stackMapTable = new StackMapTableAttribute
+        {
+            length = (uint)(2 + converted.frames.Sum(
+                (frame) => 1 + 2 + (frame.type == 255 ? (2 + 2 + frame.locals.Sum(a => a is ExpandedVerifyTypeInfo ? 3 : 1)) : 0)
+                        + frame.stack.Sum(a => a is ExpandedVerifyTypeInfo ? 3 : 1))),
+            entryCount = (ushort)converted.frames.Length,
+            entries = converted.frames
+        };
+        stackMapTable.nameIndex = AddToConstants("StackMapTable");
+        javaMethod.stackMapTable = stackMapTable;
+        if (javaMethod.stackMapTable.entryCount > 0) javaMethod.codeAttribute.length += javaMethod.stackMapTable.length + 6;
 
         methods.Add(javaMethod);
     }
@@ -410,6 +458,10 @@ internal class JavaClass
     {
         return BitConverter.ToUInt16(BitConverter.GetBytes(number).Reverse().ToArray());
     }
+    internal static ushort FlipBytes(short number)
+    {
+        return BitConverter.ToUInt16(BitConverter.GetBytes(number).Reverse().ToArray());
+    }
 
     internal static byte[] StringToBytes(string hex)
     {
@@ -477,6 +529,7 @@ internal class JavaClass
         internal ushort nameIndex;
         internal ushort descriptorIndex;
         internal CodeAttribute codeAttribute;
+        internal StackMapTableAttribute stackMapTable;
     }
 
     internal struct JavaField
@@ -501,6 +554,41 @@ internal class JavaClass
         internal ushort maxLocals;
         internal uint codeLength;
         internal byte[] code;
+    }
+
+    internal struct StackMapTableAttribute
+    {
+        internal ushort nameIndex;
+        internal uint length;
+        internal ushort entryCount;
+        internal StackMapFrame[] entries;
+    }
+    internal struct StackMapFrame
+    {
+        internal byte type;
+        internal ushort offset;
+        internal ushort localCount;
+        internal ushort stackCount;
+        internal VerifyTypeInfo[] locals;
+        internal VerifyTypeInfo[] stack;
+    }
+    internal class VerifyTypeInfo
+    {
+        internal static byte Top = 0;
+        internal static byte Integer = 1;
+        internal static byte Float = 2;
+        internal static byte Double = 3;
+        internal static byte Long = 4;
+        internal static byte Null = 5;
+        internal static byte UninitThis = 6;
+        internal static byte Object = 7;
+        internal static byte Uninit = 8;
+
+        internal byte tag;
+    }
+    internal class ExpandedVerifyTypeInfo : VerifyTypeInfo
+    {
+        internal ushort extra;
     }
 
     internal struct ClassReference
@@ -608,6 +696,7 @@ internal class JavaClass
         newarr = 0x8D,
         ldtoken = 0xD0,
         stelem_ref = 0xA2,
+        brfalse_s = 0x2C
     }
 
     internal struct Stackpoint
@@ -616,7 +705,44 @@ internal class JavaClass
         internal int depth;
     }
 
-    private ConvertedMethod ConvertMethod(MethodBase method)
+    internal struct Branchpoint
+    {
+        internal int ji;
+        internal int value;
+    }
+
+    internal VerifyTypeInfo GetVerifyTypeInfo(string? type)
+    {
+        return type.Split(".").Last() switch
+        {
+            "Int32" => new VerifyTypeInfo { tag = VerifyTypeInfo.Integer },
+            "Boolean" => new VerifyTypeInfo { tag = VerifyTypeInfo.Integer },
+            "Byte" => new VerifyTypeInfo { tag = VerifyTypeInfo.Integer },
+            "Single" => new VerifyTypeInfo { tag = VerifyTypeInfo.Float },
+            "Double" => new VerifyTypeInfo { tag = VerifyTypeInfo.Double },
+            "Int64" => new VerifyTypeInfo { tag = VerifyTypeInfo.Long },
+            "null" => new VerifyTypeInfo { tag = VerifyTypeInfo.Null },
+            "Object" => new ExpandedVerifyTypeInfo { tag = VerifyTypeInfo.Object, extra = AddToConstants(new ClassReference { name = "java/lang/Object" }) },
+            _ => new ExpandedVerifyTypeInfo { tag = VerifyTypeInfo.Object, extra = AddToConstants(new ClassReference { name = ConvertBuiltinName(type) }) }
+        };
+    }
+
+    internal void AddStackMapFrame(List<StackMapFrame> list, int offset, string?[] locals, Stack<string> stack, int argCount, byte type = 255)
+    {
+        // string?[] trimmedLocals = locals.AsSpan(argCount, locals.Length - argCount).ToArray();
+        var frame = new StackMapFrame
+        {
+            type = type,
+            offset = (ushort)offset,
+            localCount = (ushort)locals.Count(a => a != "" && a != null),
+            stackCount = (ushort)stack.Count,
+            locals = locals.Where(a => a != "" && a != null).Select(GetVerifyTypeInfo).ToArray(),
+            stack = stack.Select(GetVerifyTypeInfo).ToArray()
+        };
+        list.Add(frame);
+    }
+
+    private ConvertedMethod ConvertMethod(MethodBase method, Type declaringType)
     {
         MethodBody? body = method.GetMethodBody();
         byte[]? ilcode = body.GetILAsByteArray();
@@ -628,11 +754,45 @@ internal class JavaClass
         Stack<string> stack = new Stack<string>(body.MaxStackSize);
         ushort maxStack = (ushort)body.MaxStackSize;
         List<Stackpoint> stackpoints = [new Stackpoint { ji = 0, depth = 0 }]; // locations in the bytecode where items were added to the stack
-        List<byte> bytecode = new List<byte>();
-        string[] locals = new string[body.LocalVariables.Count + method.GetParameters().Length + 1];
+        List<Branchpoint> branchpoints = []; // locations in the bytecode where branches are done
+        List<byte> bytecode = [];
+        List<StackMapFrame> frames = [];
+        List<int> offsets = [];
+        int argCount = method.GetParameters().Length;
+        string[] locals = new string[body.LocalVariables.Count + argCount + 1];
+        // foreach (var local in body.LocalVariables)
+        // {
+        //     string name = ConvertBuiltinName(local.LocalType);
+        //     if (local.LocalType.IsPrimitive) name = "null";
+        //     locals[local.LocalIndex + argCount + 1] = name;
+        // };
+        locals[0] = ConvertBuiltinName(declaringType);
+        for (int i = 0; i < method.GetParameters().Length; i++) locals[i + 1] = method.GetParameters()[i].ParameterType.Name;
+
 
         int runtimeHandle = 0;
         int ji = 0;
+        int old_i = 0;
+        int frameOffset = 0;
+
+        // foreach (var local in body.LocalVariables)
+        // {
+        //     switch (local.LocalType.Name)
+        //     {
+        //         case "Int32":
+        //         case "Boolean":
+        //             bytecode.AddRange([0x03, 0x36, (byte)(local.LocalIndex + argCount + 1)]);
+        //             break;
+        //         case "Single":
+        //             bytecode.AddRange([0x0B, 0x38, (byte)(local.LocalIndex + argCount + 1)]);
+        //             break;
+        //         default:
+        //             bytecode.AddRange([0x01, 0x3A, (byte)(local.LocalIndex + argCount + 1)]);
+        //             break;
+        //     }
+        //     frameOffset += 3;
+        //     ji += 3;
+        // }
 
         for (int i = 0; i < ilcode.Length; i++)
         {
@@ -642,10 +802,22 @@ internal class JavaClass
             byte[] newArgs = [];
             string debug = "";
             bool valid = true;
+            bool skip = false;
+
+            offsets.Add(i);
+            offsets.Add(ji);
+            old_i = i;
 
             int offset;
             string item; // both are used later so i just define them here
             FieldInfo resolvedField;
+
+            foreach (Branchpoint bp in branchpoints) if (bp.value == i)
+                {
+                    AddStackMapFrame(frames, frameOffset, locals, stack, argCount, 251);
+                    frameOffset = -1;
+                }
+
             try
             {
                 switch (opcode)
@@ -664,14 +836,14 @@ internal class JavaClass
                         offset = (byte)(opcode - Opcodes.ldarg_0);
                         if (opcode == Opcodes.ldarg_s) offset = ilcode[++i];
                         item = offset > 0 ? method.GetParameters()[offset - 1].ParameterType.Name : "this";
-                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
+                        if (item == "Int32" || item == "Boolean") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
                         else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
                         else if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
                         else if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
                         else newOpcode = offset > 3 ? (byte)0x19 : (byte)(0x2A + offset);
                         if (opcode == Opcodes.ldarg_0) newOpcode = 0x2A;
                         if (offset > 3) newArgs = [(byte)offset];
-                        stack.Push(opcode == Opcodes.ldarg_0 ? method.DeclaringType.Name : method.GetParameters()[offset - 1].Name);
+                        stack.Push(opcode == Opcodes.ldarg_0 ? method.DeclaringType.FullName : method.GetParameters()[offset - 1].ParameterType.FullName);
                         stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
                         debug += " +sp";
                         break;
@@ -682,12 +854,13 @@ internal class JavaClass
                     case Opcodes.ldloc_s:
                         offset = (byte)(opcode - Opcodes.ldloc_0);
                         if (opcode == Opcodes.ldloc_s) offset = ilcode[++i];
-                        offset += method.GetParameters().Length + 1;
+                        offset += argCount + 1;
                         item = locals[offset];
-                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
-                        else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
-                        else if (item == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
-                        else if (item == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
+                        string splitItem = item.Split('.', '/').Last();
+                        if (splitItem == "Int32" || splitItem == "Boolean") newOpcode = offset > 3 ? (byte)0x15 : (byte)(0x1A + offset);
+                        else if (splitItem == "Int64") newOpcode = offset > 3 ? (byte)0x16 : (byte)(0x1E + offset);
+                        else if (splitItem == "Single") newOpcode = offset > 3 ? (byte)0x17 : (byte)(0x22 + offset);
+                        else if (splitItem == "Double") newOpcode = offset > 3 ? (byte)0x18 : (byte)(0x26 + offset);
                         else newOpcode = offset > 3 ? (byte)0x19 : (byte)(0x2A + offset);
                         if (offset > 3) newArgs = [(byte)offset];
                         stack.Push(item);
@@ -702,12 +875,13 @@ internal class JavaClass
                         offset = (byte)(opcode - Opcodes.stloc_0);
                         if (opcode == Opcodes.stloc_s) offset = ilcode[++i];
                         item = stack.Pop();
-                        locals[offset] = item;
+                        splitItem = item.Split('.', '/').Last();
                         offset += method.GetParameters().Length + 1;
-                        if (item == "Int32") newOpcode = offset > 3 ? (byte)0x36 : (byte)(0x3B + offset);
-                        else if (item == "Int64") newOpcode = offset > 3 ? (byte)0x37 : (byte)(0x3F + offset);
-                        else if (item == "Single") newOpcode = offset > 3 ? (byte)0x38 : (byte)(0x43 + offset);
-                        else if (item == "Double") newOpcode = offset > 3 ? (byte)0x39 : (byte)(0x47 + offset);
+                        locals[offset] = item;
+                        if (splitItem == "Int32" || splitItem == "Boolean") newOpcode = offset > 3 ? (byte)0x36 : (byte)(0x3B + offset);
+                        else if (splitItem == "Int64") newOpcode = offset > 3 ? (byte)0x37 : (byte)(0x3F + offset);
+                        else if (splitItem == "Single") newOpcode = offset > 3 ? (byte)0x38 : (byte)(0x43 + offset);
+                        else if (splitItem == "Double") newOpcode = offset > 3 ? (byte)0x39 : (byte)(0x47 + offset);
                         else newOpcode = offset > 3 ? (byte)0x3A : (byte)(0x4B + offset);
                         if (offset > 3) newArgs = [(byte)offset];
                         break;
@@ -732,7 +906,7 @@ internal class JavaClass
                     case Opcodes.ldc_i4_8:
                         offset = (byte)(opcode - Opcodes.ldc_i4_0);
                         newOpcode = 0x12;
-                        stack.Push("Integer");
+                        stack.Push("Int32");
                         stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
                         debug += " +sp";
                         newArgs = [(byte)AddToConstants(offset)];
@@ -770,6 +944,7 @@ internal class JavaClass
                             Type resolved = module.ResolveType(runtimeHandle);
                             newArgs = [(byte)AddToConstants(new ClassReference { name = ConvertBuiltinName(resolved) })];
                             stack.Pop();
+                            stack.Push(ConvertBuiltinName(resolved));
                             debug = ConvertBuiltinName(resolved);
                             i += 4;
                             break;
@@ -795,16 +970,17 @@ internal class JavaClass
                             newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(methodRef)));
                         }
                         foreach (var param in resolvedMethod.GetParameters()) stack.Pop();
+                        if (!resolvedMethod.IsStatic) stack.Pop();
                         if (resolvedMethod is MethodInfo && (resolvedMethod as MethodInfo).ReturnType != typeof(void))
                         {
-                            stack.Push((resolvedMethod as MethodInfo).ReturnType.Name);
+                            stack.Push(ConvertBuiltinName((resolvedMethod as MethodInfo).ReturnType));
                             stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
                             debug += " +sp";
                         }
                         i += 4;
                         break;
                     case Opcodes.ret:
-                        if (returnType == "Int32") newOpcode = 0xAC;
+                        if (returnType == "Int32" || returnType == "Boolean") newOpcode = 0xAC;
                         else if (returnType == "Int64") newOpcode = 0xAD;
                         else if (returnType == "Single") newOpcode = 0xAE;
                         else if (returnType == "Double") newOpcode = 0xAF;
@@ -852,6 +1028,12 @@ internal class JavaClass
                     case Opcodes.newobj:
                         args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
                         Type resolvedType = module.ResolveMethod(BitConverter.ToInt32(args)).DeclaringType;
+                        if (resolvedType == typeof(Java.Class))
+                        {
+                            skip = true;
+                            i += 4;
+                            break;
+                        }
                         newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new ClassReference() { name = ConvertBuiltinName(resolvedType) })));
                         MethodReference _evenMoreMethodRef = new MethodReference()
                         {
@@ -859,7 +1041,7 @@ internal class JavaClass
                             nameTypeDesc = new NameTypeReference() { name = "<init>", descriptor = GetMethodDescriptor(resolvedType.GetConstructors()[0]) }
                         };
                         debug = ConvertBuiltinName(resolvedType);
-                        stack.Push(resolvedType.Name);
+                        stack.Push(ConvertBuiltinName(resolvedType));
                         // java is stupid and requires manual constructor invocation
                         int paramCount = resolvedType.GetConstructors()[0].GetParameters().Length;
                         if (paramCount == 0)
@@ -910,7 +1092,7 @@ internal class JavaClass
                         })));
                         newOpcode = resolvedField.IsStatic ? (byte)0xB2 : (byte)0xB4;
                         debug = GetFieldName(resolvedField);
-                        stack.Push(resolvedField.FieldType.Name);
+                        stack.Push(ConvertBuiltinName(resolvedField.FieldType));
                         stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
                         debug += " +sp";
                         i += 4;
@@ -921,7 +1103,8 @@ internal class JavaClass
                         resolvedType = module.ResolveType(BitConverter.ToInt32(args));
                         newArgs = BitConverter.GetBytes(FlipBytes(AddToConstants(new ClassReference { name = ConvertBuiltinName(resolvedType) })));
                         debug = ConvertBuiltinName(resolvedType) + "[]";
-                        stack.Push("Array");
+                        stack.Pop();
+                        stack.Push($"[{TypeToLetter(resolvedType)}");
                         stackpoints.Add(new Stackpoint { ji = ji, depth = oldStack });
                         debug += " +sp";
                         i += 4;
@@ -929,10 +1112,27 @@ internal class JavaClass
                     case Opcodes.ldtoken:
                         args = new ArraySegment<byte>(ilcode, i + 1, 4).ToArray();
                         runtimeHandle = BitConverter.ToInt32(args);
+                        stack.Push("handle"); // not actually gonna be used, but keeps the stack at the right size
                         i += 4;
+                        skip = true;
                         break;
                     case Opcodes.stelem_ref:
                         newOpcode = 0x53;
+                        stack.Pop();
+                        stack.Pop();
+                        stack.Pop();
+                        break;
+                    case Opcodes.brfalse_s:
+                        args = [ilcode[i + 1]];
+                        newOpcode = 0x99;
+                        newArgs = [0, 0]; // fill in the correct value in the branch pass
+                        stack.Pop();
+                        branchpoints.Add(new Branchpoint { ji = ji, value = i + args[0] + 1 });
+                        int jiDifference = ji - stackpoints.Last(sp => sp.ji < ji && sp.depth == 0).ji;
+                        AddStackMapFrame(frames, frameOffset - jiDifference, locals, stack, argCount);
+                        frameOffset = jiDifference - 1;
+                        debug = Convert.ToString(i + ilcode[i + 1]) + " +bp";
+                        i += 1;
                         break;
                     default:
                         if (logLevel.HasFlag(LogLevel.Bytecode))
@@ -951,29 +1151,61 @@ internal class JavaClass
                 Console.WriteLine($"Error in opcode: {opcode} ({debug})");
                 throw;
             }
-            ji += 1 + newArgs.Length;
             if (valid)
             {
-                bytecode.Add(newOpcode);
-                foreach (byte arg in newArgs) bytecode.Add(arg);
+                if (!skip) bytecode.Add(newOpcode);
+                if (!skip) foreach (byte arg in newArgs) bytecode.Add(arg);
                 if (logLevel.HasFlag(LogLevel.Bytecode))
                 {
                     Console.ForegroundColor = ConsoleColor.Gray;
                     Console.Write($"        {oldStack}:{stack.Count} ");
                     Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.Write($"{Enum.GetName(opcode)}{(args.Length > 0 ? " " : "")}{BitConverter.ToString(args)}");
+                    Console.Write($"#{old_i} {Enum.GetName(opcode)}{(args.Length > 0 ? " " : "")}{BitConverter.ToString(args)}");
                     Console.ForegroundColor = ConsoleColor.White;
                     Console.Write(" > ");
                     Console.ForegroundColor = ConsoleColor.DarkRed;
-                    Console.Write($"{BitConverter.ToString([newOpcode])} {BitConverter.ToString(newArgs)}");
+                    if (!skip) Console.Write($"#{ji} {BitConverter.ToString([newOpcode])} {BitConverter.ToString(newArgs)}");
+                    else Console.Write($"SKIPPED");
                     Console.ForegroundColor = ConsoleColor.Gray;
-                    Console.Write($"{(debug.Length > 0 ? " (" : "")}{debug}{(debug.Length > 0 ? ")" : "")}\n");
+                    Console.Write($"{(debug.Length > 0 ? " (" : "")}{debug}{(debug.Length > 0 ? ")" : "")}");
+                    if (logLevel.HasFlag(LogLevel.Locals))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Blue;
+                        Console.Write($" [{string.Join(", ", locals)}]");
+                    }
+                    if (logLevel.HasFlag(LogLevel.Stack))
+                    {
+                        Console.ForegroundColor = ConsoleColor.DarkCyan;
+                        Console.Write($" <{string.Join(", ", stack)}>");
+                    }
+                    Console.Write("\n");
                     Console.ForegroundColor = ConsoleColor.White;
                 }
                 oldStack = stack.Count;
             }
+            if (!skip) ji += 1 + newArgs.Length;
+            if (!skip) frameOffset += 1 + newArgs.Length;
         }
-        return new ConvertedMethod { code = bytecode.ToArray(), maxStack = maxStack };
+        foreach (Branchpoint bp in branchpoints)
+        {
+            bytecode.RemoveRange(bp.ji + 1, 2);
+            byte[] value = BitConverter.GetBytes(FlipBytes((short)(offsets[offsets.IndexOf(bp.value) + 1] - bp.ji)));
+            bytecode.InsertRange(bp.ji + 1, value);
+            // bytecode.RemoveAt(offsets[offsets.IndexOf(bp.value) + 1]);
+            // bytecode.Insert(offsets[offsets.IndexOf(bp.value) + 1], 0x57);
+
+            if (logLevel.HasFlag(LogLevel.Bytecode))
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.Write($"        BRANCHPOINT {bp.value}");
+                Console.ForegroundColor = ConsoleColor.White;
+                Console.Write(" > ");
+                Console.ForegroundColor = ConsoleColor.DarkRed;
+                Console.Write($"{BitConverter.ToString(value)}\n");
+                Console.ForegroundColor = ConsoleColor.White;
+            }
+        }
+        return new ConvertedMethod { code = bytecode.ToArray(), maxStack = maxStack, frames = frames.ToArray() };
     }
 
     internal static string TypeToLetter(Type type, bool mojangClasses = false)
@@ -991,6 +1223,7 @@ internal class JavaClass
             "Void" => "V",
             "Object" => "Ljava/lang/Object;",
             "Type" => "Ljava/lang/Class;",
+            "Class" => "Ljava/lang/Class;",
             _ => (type.IsArray ? "[" : "") + "L" + ConvertBuiltinName(type, mojangClasses).Replace(".", "/").Replace("[]", "") + ";"
 
         };
@@ -1016,6 +1249,7 @@ internal class JavaClass
         return type.Name.Replace("[]", "") switch
         {
             "Int32" => "java/lang/Integer",
+            "Boolean" => "java/lang/Boolean",
             "Single" => "java/lang/Float",
             "Char" => "java/lang/Character",
             "Int64" => "java/lang/Long",
@@ -1024,6 +1258,24 @@ internal class JavaClass
             "Object" => "java/lang/Object",
             "Type" => "java/lang/Class",
             _ => GetClassName(type, mojangClasses)
+        };
+    }
+
+    internal static string ConvertBuiltinName(string type)
+    {
+        return type.Replace("[]", "").Split(".").Last() switch
+        {
+            "Int32" => "java/lang/Integer",
+            "Boolean" => "java/lang/Boolean",
+            "Single" => "java/lang/Float",
+            "Char" => "java/lang/Character",
+            "Int64" => "java/lang/Long",
+            "Int16" => "java/lang/Short",
+            "String" => "java/lang/String",
+            "Object" => "java/lang/Object",
+            "Type" => "java/lang/Class",
+            "Class" => "java/lang/Class",
+            _ => type
         };
     }
 
@@ -1138,6 +1390,7 @@ internal class JavaClass
         writer.WriteUInt16(method.nameIndex);
         writer.WriteUInt16(method.descriptorIndex);
         writer.WriteUInt16(1); // attribute count
+
         writer.WriteUInt16(method.codeAttribute.nameIndex);
         writer.WriteUInt32(method.codeAttribute.length);
         writer.WriteUInt16(method.codeAttribute.maxStack);
@@ -1145,7 +1398,34 @@ internal class JavaClass
         writer.WriteUInt32(method.codeAttribute.codeLength);
         writer.WriteBytes(method.codeAttribute.code);
         writer.WriteUInt16(0); // exception table length
-        writer.WriteUInt16(0); // attribute count
+        writer.WriteUInt16((ushort)(method.stackMapTable.entryCount == 0 ? 0 : 1)); // attribute count
+
+        if (method.stackMapTable.entryCount > 0)
+        {
+            writer.WriteUInt16(method.stackMapTable.nameIndex);
+            writer.WriteUInt32(method.stackMapTable.length);
+            writer.WriteUInt16(method.stackMapTable.entryCount);
+            foreach (StackMapFrame entry in method.stackMapTable.entries)
+            {
+                writer.WriteByte(entry.type);
+                writer.WriteUInt16(entry.offset);
+                if (entry.type == 255)
+                {
+                    writer.WriteUInt16(entry.localCount);
+                    foreach (VerifyTypeInfo local in entry.locals)
+                    {
+                        writer.WriteByte(local.tag);
+                        if (local is ExpandedVerifyTypeInfo) writer.WriteUInt16(((ExpandedVerifyTypeInfo)local).extra);
+                    }
+                    writer.WriteUInt16(entry.stackCount);
+                }
+                foreach (VerifyTypeInfo item in entry.stack)
+                {
+                    writer.WriteByte(item.tag);
+                    if (item is ExpandedVerifyTypeInfo) writer.WriteUInt16(((ExpandedVerifyTypeInfo)item).extra);
+                }
+            }
+        }
     }
 }
 
