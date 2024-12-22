@@ -7,31 +7,16 @@ using Pilynth.Attributes;
 using Kermalis.EndianBinaryIO;
 using Pilynth.Fabric;
 using System.Xml.Linq;
-using System.Runtime.CompilerServices;
 
 namespace Pilynth;
 
-public class Mod
+public class ModBuilder
 {
-    public Mod(string[] args)
+    internal string? mcVersion;
+    internal JavaClass.LogLevel logLevel = JavaClass.LogLevel.None;
+
+    public ModBuilder(string[] args)
     {
-        if (args.Length == 0)
-        {
-            Console.WriteLine("Version number is required");
-            return;
-        }
-        string mcVersion = args[0];
-
-        Console.WriteLine($"Building mod for {mcVersion}");
-
-        YarnMappings.PrepareMappings(mcVersion);
-
-        Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
-        List<JavaClass> classes = [];
-        string identifier = "", version = "", entrypoint = "";
-        JavaClass entryClass = null;
-
-        JavaClass.LogLevel logLevel = JavaClass.LogLevel.None;
         if (args.Length > 1 && args[1].StartsWith("--"))
         {
             if (args[1].Contains("p")) logLevel |= JavaClass.LogLevel.ConstantPool;
@@ -41,6 +26,30 @@ public class Mod
             if (args[1].Contains("l")) logLevel |= JavaClass.LogLevel.Locals;
             if (args[1].Contains("s")) logLevel |= JavaClass.LogLevel.Stack;
         }
+    }
+
+    public ModBuilder Version(string mcVersion)
+    {
+        this.mcVersion = mcVersion;
+        return this;
+    }
+
+    public void Build()
+    {
+        if (mcVersion == null)
+        {
+            Console.Error.WriteLine("Missing target Minecraft version.");
+            return;
+        }
+
+        Console.WriteLine($"Building mod for {mcVersion}");
+
+        YarnMappings.PrepareMappings(mcVersion);
+
+        Type[] types = Assembly.GetEntryAssembly().GetExportedTypes();
+        List<JavaClass> classes = [];
+        string identifier = "", version = "", entrypoint = "";
+        JavaClass entryClass = null;
 
         List<Type> items = [];
         List<Type> blocks = [];
@@ -59,12 +68,12 @@ public class Mod
             if (typeof(Block).IsAssignableFrom(type)) blocks.Add(type);
         }
 
-        entryClass.HandleMethod(typeof(Mod).GetMethod("_RegisterItem", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
-        entryClass.HandleMethod(typeof(Mod).GetMethod("_RegisterBlock", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
+        entryClass.HandleMethod(typeof(ModBuilder).GetMethod("_RegisterItem", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
+        entryClass.HandleMethod(typeof(ModBuilder).GetMethod("_RegisterBlock", BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public), entryClass.originalType, true);
 
         foreach (Type item in items)
         {
-            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(Mod), "_RegisterItem", 3);
+            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(ModBuilder), "_RegisterItem", 3);
             methodRef.classRef = JavaClass.GetClassReference(entryClass.originalType);
             entryClass.ExtendInitializeMethod(JavaClass.StringToBytes(
                 "2A"
@@ -77,7 +86,7 @@ public class Mod
         }
         foreach (Type block in blocks)
         {
-            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(Mod), "_RegisterBlock", 4);
+            JavaClass.MethodReference methodRef = JavaClass.GetMethodReference(typeof(ModBuilder), "_RegisterBlock", 4);
             methodRef.classRef = JavaClass.GetClassReference(entryClass.originalType);
             entryClass.ExtendInitializeMethod(JavaClass.StringToBytes(
                 "2A"
@@ -105,7 +114,7 @@ public class Mod
     internal void _RegisterBlock(Java.Class type, string ns, string id, bool withItem)
     {
         RegistryKey key = RegistryKey.of(RegistryKey.ofRegistry(Identifier.of("block")), Identifier.of(ns, id));
-        object instance = type.GetConstructor([typeof(Block.Settings)]).NewInstance([AbstractBlock.Settings.create().registryKey(key)]);
+        object instance = type.GetConstructor([typeof(AbstractBlock.Settings)]).NewInstance([AbstractBlock.Settings.create().registryKey(key)]);
         if (withItem)
         {
             RegistryKey itemKey = RegistryKey.of(RegistryKey.ofRegistry(Identifier.of("item")), Identifier.of(ns, id));
@@ -1217,7 +1226,7 @@ internal class JavaClass
             "Double" => "D",
             "Char" => "C",
             "Byte" => "B",
-            "Int64" => "L",
+            "Int64" => "J",
             "Boolean" => "Z",
             "Int16" => "S",
             "Void" => "V",

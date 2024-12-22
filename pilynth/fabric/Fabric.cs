@@ -1,5 +1,3 @@
-#pragma warning disable CS8603
-
 using Pilynth.Attributes;
 
 namespace Pilynth.Fabric;
